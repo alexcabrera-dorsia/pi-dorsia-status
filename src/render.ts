@@ -415,35 +415,19 @@ export function packRow(
 // All icons are Nerd Font PUA glyphs (Font Awesome band U+F000–U+F2E0),
 // verified to render in BlexMono Nerd Font (the installed font).
 const GLYPH = {
-  // lane badges
-  agent: "\uf0e8",   // nf-fa-sitemap (agent/workflow)
-  session: "\uf0e4", // nf-fa-tachometer (context/tokens/time)
-  work: "\uf07c",   // nf-fa-folder_open (repo/workspace)
-  sessions: "\uf0c0", // nf-fa-group (tabs/people)
-  control: "\uf013", // nf-fa-gear (control/system)
-  // session row
-  tokens: "\uf0d1", // nf-oct-database (in/out)
+  // model row
+  session: "\uf0e4", // nf-fa-tachometer (context window meter)
   cost: "\uf155",   // nf-fa-dollar
-  turn: "\uf01e",   // nf-fa-rotate (turn)
-  clock: "\uf017",  // nf-fa-clock_o
   duration: "\uf0e7", // nf-fa-bolt (time spent working)
   model: "\uf2d0",  // nf-oct-cpu (provider/model)
+  thinking: "\uf0eb", // nf-fa-lightbulb (thinking level)
   // work row
   branch: "\uf126", // nf-oct-git_branch
-  clean: "\uf00c",  // nf-fa-check
   pr: "\uf09b",     // nf-fa-github (PR proxy)
   linear: "\uf0ae", // nf-fa-tasks (Linear/issues)
-  // sessions row
-  pane: "\uf2d0",   // nf-fa-window_maximize
-  deleg: "\uf0ec",  // nf-fa-exchange
-  // control row
-  todo: "\uf03a",   // nf-fa-list_ul
-  mcp: "\uf1e6",    // nf-fa-plug
-  orca: "\uf2db",   // nf-fa-microchip
-  alert: "\uf06a",  // nf-fa-exclamation_circle
-  blocker: "\uf05e", // nf-fa-ban
-  me: "\uf007",     // nf-fa-user
-  thinking: "\uf0eb", // nf-fa-lightbulb
+  // fleet row
+  sessions: "\uf0c0", // nf-fa-group (peers/tabs)
+  deleg: "\uf0ec",  // nf-fa-exchange (delegations)
 };
 
 function stateTone(state: AgentLane["state"]): Tone {
