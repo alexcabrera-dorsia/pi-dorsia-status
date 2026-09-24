@@ -1,14 +1,14 @@
 /**
- * dorsia-status — five-row status footer for pi.
+ * dorsia-status — four-row status footer for pi.
  *
- * Sole owner of ctx.ui.setFooter(). Renders exactly 5 rows every render:
- *   1. AGENT    — local agent state, current tool/file, model, thinking level
- *   2. SESSION  — context bar + %, tokens, cost, turn, clock
- *   3. WORK     — Orca workspace name / cwd tail, git branch + dirty, PR/Linear
- *   4. SESSIONS — [me] + sibling pi sessions as Orca tabs in this worktree
- *   5. CONTROL  — todo progress, delegations, transient alert, MCP/skills, Orca freshness
+ * Sole owner of ctx.ui.setFooter(). Renders exactly 4 rows every render:
+ *   1. MODEL   — provider/model, thinking level, context %, token I/O, cost,
+ *                time spent working, cost/hr (live agent state lives in the
+ *                editor-border working indicator instead)
+ *   2. WORK    — git branch, diff +/-, PR + Linear links (OSC 8 clickable)
+ *   3. FLEET   — active peer/subagent count, delegations, per-peer summaries
+ *   4. CONTROL — MCP health, Orca freshness, honcho/external segments, alerts
  *
- * Subsumes agent-state-status.ts (state machine folded inline below).
  * Compat bridge: unknown setStatus() keys surface in CONTROL (capped at 1).
  *
  * Event-bus protocol:
@@ -19,9 +19,10 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { existsSync } from "node:fs";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ReadonlyFooterDataProvider } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
-import { emptySnapshot, renderStatus, setStatuslineTheme, type Lane, type Segment, type SessionInfo, type SessionsLane, type StatuslineThemeId, type Snapshot, type StatusTheme, STATUSLINE_THEMES } from "./render.ts";
+import { emptySnapshot, renderStatus, sanitize, setStatuslineTheme, type Lane, type Segment, type SessionInfo, type SessionsLane, type StatuslineThemeId, type Snapshot, type StatusTheme, STATUSLINE_THEMES } from "./render.ts";
 import { normalizeSessions, startOrcaPolling, type OrcaPoller, type WorktreeMeta } from "./orca.ts";
 
 const SEGMENT_CHANNEL = "dorsia-status:segment/v1";
@@ -31,6 +32,7 @@ const MCP_STATUS_CHANNEL = "pi-mcp-adapter/status/v1";
 
 /** Status keys we consume natively — excluded from the compat bridge. */
 const KNOWN_STATUS_KEYS = new Set(["agent-state", "thinking-state", "mcp-skills", "todos", "cli-delegate", "ponytail"]);
+
 
 
 // ── agent state machine (folded from agent-state-status.ts) ─────────────────
@@ -80,13 +82,6 @@ function joinedModelId(modelId: string | undefined, provider?: string | undefine
 
 const MIN = 60_000;
 const HOUR = 60 * MIN;
-
-function fmtDuration(ms: number): string {
-  if (ms < MIN) return `${Math.max(1, Math.round(ms / 1000))}s`;
-  const h = Math.floor(ms / HOUR);
-  const m = Math.floor((ms % HOUR) / MIN);
-  return h > 0 ? `${h}h${String(m).padStart(2, "0")}m` : `${m}m`;
-}
 
 function fmtCostRate(usd: number | undefined, ms: number): string | undefined {
   if (usd == null || ms <= 0) return undefined;
@@ -145,13 +140,165 @@ export default function (pi: ExtensionAPI) {
   let thinkingLevel: string | undefined;
   let thinkingOn = false;
 
-  // Session wall-clock start (Q8: duration + cost rate).
+  // Session wall-clock start (cost rate).
   let sessionStartedAt = 0;
 
-  // Context-% history ring buffer for the braille sparkline (Q5).
-  const HISTORY_N = 8;
-  let ctxHistory: number[] = [];
-  let lastHistoryAt = 0;
+  // Working-time clock: ticks ONLY while the agent is actively thinking or
+  // writing inside a turn. Paused while tools execute and while waiting for
+  // user input — pure model-work time, nothing else.
+  let workedMs = 0;
+  let workClockRunning = false;
+  let workClockSince = 0;
+
+  function pauseWorkClock(): void {
+    if (!workClockRunning) return;
+    workedMs += Date.now() - workClockSince;
+    workClockRunning = false;
+  }
+
+  function resumeWorkClock(): void {
+    if (workClockRunning) return;
+    workClockRunning = true;
+    workClockSince = Date.now();
+  }
+
+  // Cost accumulators — persisted via custom session entries so /reload and
+  // session resume keep the totals (in-memory state alone zeroes on reload).
+  let sessionCostUsd: number | undefined;
+  let subagentSpendUsd = 0;
+  const COST_ENTRY_TYPE = "dorsia-status:cost";
+
+  function persistCost(): void {
+    try {
+      pi.appendEntry(COST_ENTRY_TYPE, { sessionCostUsd, subagentSpendUsd, workedMs });
+    } catch {
+      /* persistence is best effort */
+    }
+  }
+
+  /** Restore cost totals from the last persisted custom entry (reload/resume). */
+  function restoreCost(ctx: ExtensionContext): void {
+    try {
+      const entries = ctx.sessionManager.getEntries() as { type?: string; customType?: string; data?: { sessionCostUsd?: number; subagentSpendUsd?: number; workedMs?: number } }[];
+      for (let i = entries.length - 1; i >= 0; i--) {
+        const e = entries[i];
+        if (e.type === "custom" && e.customType === COST_ENTRY_TYPE && e.data) {
+          sessionCostUsd = typeof e.data.sessionCostUsd === "number" ? e.data.sessionCostUsd : undefined;
+          subagentSpendUsd = typeof e.data.subagentSpendUsd === "number" ? e.data.subagentSpendUsd : 0;
+          workedMs = typeof e.data.workedMs === "number" ? e.data.workedMs : 0;
+          snapshot.session.costUsd = sessionCostUsd;
+          snapshot.sessions.subagentSpendUsd = subagentSpendUsd;
+          snapshot.session.workTimeMs = workedMs > 0 ? workedMs : undefined;
+          return;
+        }
+      }
+    } catch {
+      /* restore is best effort */
+    }
+  }
+
+  // ── session summary + current topic (row 4) ─────────────────────────────
+
+  /** Rolling digest of recent tool activity, oldest → newest. */
+  const ACTIVITY_MAX = 12;
+  let activityLog: string[] = [];
+  /** Thinking monitor: accumulated reasoning of the current episode (prompt input). */
+  const THINK_BUFFER_MAX = 4000;
+  let thinkingBuffer = "";
+  let summaryFingerprint = "";
+  let lastSummaryAt = 0;
+  let summaryInFlight = false;
+  const SUMMARY_MIN_INTERVAL_MS = 45_000;
+  const SUMMARY_MODEL = process.env.PI_STATUS_SUMMARY_MODEL ?? "hyper/glm-5.3-flash";
+
+  /** The hyper provider ships as a pi package (extension) — locate it so the
+   *  headless summary run can load JUST that provider (fast, no other
+   *  extensions, no MCP connections). Falls back to normal discovery. */
+  const HYPER_PROVIDER_EXT = join(homedir(), ".pi/agent/npm/node_modules/@charmland/pi-hyper-provider/src/index.ts");
+
+  function describeToolArgs(tool: string, args: unknown): string {
+    const a = (args ?? {}) as Record<string, unknown>;
+    if (tool === "read" || tool === "write" || tool === "edit") {
+      const p = typeof a.path === "string" ? a.path : typeof a.to === "string" ? a.to : "";
+      const base = p ? p.split("/").filter(Boolean).slice(-2).join("/") : "";
+      return `${tool} ${base}`.trim();
+    }
+    if (tool === "bash") {
+      const cmd = typeof a.command === "string" ? a.command.replace(/\s+/g, " ").slice(0, 60) : "";
+      return `bash ${cmd}`.trim();
+    }
+    return tool;
+  }
+
+  function recordActivity(tool: unknown, args: unknown): void {
+    if (typeof tool !== "string") return;
+    activityLog.push(describeToolArgs(tool, args));
+    if (activityLog.length > ACTIVITY_MAX) activityLog.shift();
+  }
+
+  /** Digest of what the thinking summary is based on — skips identical
+   *  regeneration attempts. */
+  function summaryDigest(): string {
+    return JSON.stringify([thinkingBuffer.slice(-800), activityLog.slice(-6)]);
+  }
+
+  function buildSummaryPrompt(): string {
+    const activity = activityLog.length ? activityLog.slice(-8).map((a) => `- ${a}`).join("\n") : "- (none yet)";
+    return [
+      "You are the live status line of a coding agent's UI, updated in place.",
+      "Below is the tail of the agent's reasoning stream plus its recent tool activity.",
+      "Write ONE short sentence (max 70 characters) describing what is happening right now.",
+      "Present tense, plain ASCII, no quotes, no markup, no emoji. Be specific; do not mention the user or any prompt.",
+      "",
+      "Reasoning stream (abridged, oldest first):",
+      thinkingBuffer,
+      "",
+      "Recent agent activity:",
+      activity,
+      "",
+      "Reply with ONLY the summary line.",
+    ].join("\n");
+  }
+
+  /** Refresh the row-4 thinking summary with a cheap headless one-shot model
+   *  run while the agent thinks. Fire-and-forget: keeps the previous text on
+   *  failure, throttled and change-gated so it never burns tokens needlessly. */
+  async function refreshThinkingSummary(): Promise<void> {
+    if (summaryInFlight) return;
+    if (agentState.kind === "idle") return; // only while a turn is active
+    if (!thinkingBuffer.trim() && activityLog.length === 0) return;
+    const now = Date.now();
+    if (now - lastSummaryAt < SUMMARY_MIN_INTERVAL_MS) return;
+    const digest = summaryDigest();
+    if (digest === summaryFingerprint) return; // nothing new to summarize
+    summaryInFlight = true;
+    try {
+      // `--no-extensions` + explicit `-e` for the hyper provider: the summary
+      // run is a bare one-shot completion — no tools, no MCP, no session.
+      const hyperExtAvailable = existsSync(HYPER_PROVIDER_EXT);
+      const args = [
+        "-p", "--no-session", "--no-skills", "--no-prompt-templates", "--no-themes",
+        "--no-context-files", "--no-tools", "--thinking", "off",
+        "--model", SUMMARY_MODEL,
+      ];
+      if (hyperExtAvailable) args.push("--no-extensions", "-e", HYPER_PROVIDER_EXT);
+      args.push("--", buildSummaryPrompt());
+      const result = await pi.exec("pi", args, { timeout: 90_000 });
+      if (result.code === 0) {
+        const line = sanitize(result.stdout.split("\n").find((l) => l.trim()) ?? "");
+        if (line) {
+          snapshot.control.thinkingSummary = line.slice(0, 80);
+          summaryFingerprint = digest;
+          lastSummaryAt = Date.now();
+          invalidate(true);
+        }
+      }
+    } catch {
+      /* keep previous summary on failure */
+    } finally {
+      summaryInFlight = false;
+    }
+  }
 
   // Git ahead/behind cache (Q9). Refreshed asynchronously; read synchronously per render.
   let gitAbCache: { ref: string; ts: number; result: { ahead: number; behind: number } | null } | null = null;
@@ -190,6 +337,9 @@ export default function (pi: ExtensionAPI) {
   // Delegation ids seen live (delegation:lane emits update per in-flight entry, remove on completion).
   const activeDelegations = new Set<string>();
 
+  /** In-flight tool calls (id → tool+args) for the activity digest. */
+  const pendingTools = new Map<string, { tool: string; args: unknown }>();
+
   // Segment registry: lane → id → Segment.
   const segmentStore = new Map<Lane, Map<string, Segment>>();
 
@@ -225,12 +375,14 @@ export default function (pi: ExtensionAPI) {
     const c = snap.control;
     return [
       a.state, a.activity, a.model ?? "", a.routedModel ?? "", a.thinkingLevel ?? "", a.thinkingOn,
-      s.percent ?? "", s.tokens ?? "", s.costUsd ?? "", s.turn ?? "",
-      s.duration ?? "", s.costRate ?? "", (s.history ?? []).join(","),
+      s.percent ?? "", s.tokens ?? "", s.costUsd ?? "", s.workTimeMs ?? "",
+      s.costRate ?? "",
       w.branch ?? "", w.workspace ?? "", w.dirtyAdded ?? "", w.dirtyRemoved ?? "",
       w.ahead ?? "", w.behind ?? "", w.prLink ?? "", w.prUrl ?? "",
       w.linearLink ?? "", w.linearUrl ?? "",
       ss.siblings.length, ss.hiddenCount, ss.me?.role ?? "",
+      ss.subagentsRunning ?? "", ss.subagentSpendUsd ?? "",
+      c.thinkingSummary ?? "",
       c.todoDone ?? "", c.todoTotal ?? "", c.activeDelegations ?? "",
       c.mcpConnected ?? "", c.mcpEnabled ?? "",
       c.orcaFreshness?.state ?? "", c.blocker ?? "", c.transientAlert ?? "",
@@ -247,43 +399,72 @@ export default function (pi: ExtensionAPI) {
     tuiRef.requestRender();
   }
 
-  function updateAgentLane(): void {
+  function updateAgentLane(ctx?: ExtensionContext): void {
     const { state, activity } = stateToActivity(agentState);
     snapshot.agent = { state, activity, model: joinedModelId(currentModel, currentProvider), routedModel, thinkingLevel, thinkingOn };
+    syncWorkingMessage(ctx);
+  }
+
+  // ── granular working message (pi-core editor-border indicator) ──────────
+
+  let lastWorkingMessage: string | undefined;
+
+  /** Map the agent-state machine to the working-status message shown in the
+   *  editor's top border. `undefined` → pi's default "Working (esc to interrupt)". */
+  function workingMessageFor(state: AgentState): string | undefined {
+    switch (state.kind) {
+      case "thinking": return "thinking";
+      case "writing": return "writing";
+      case "calling-tools": return state.tool === "planning" ? "planning" : `running ${state.tool}`;
+      case "reading": return `reading ${state.path}`;
+      case "editing": return `editing ${state.path}`;
+      default: return undefined; // working / idle → pi's default message
+    }
+  }
+
+  /** Push the current state into pi's built-in working indicator. Guarded so
+   *  high-frequency streaming events only touch the UI on actual transitions. */
+  function syncWorkingMessage(ctx?: ExtensionContext): void {
+    if (ctx?.mode !== "tui") return;
+    const message = workingMessageFor(agentState);
+    if (message === lastWorkingMessage) return;
+    try {
+      ctx.ui.setWorkingMessage(message);
+      lastWorkingMessage = message; // only mark synced after the call succeeded
+    } catch {
+      /* best effort — indicator is cosmetic; leave unmarked so we retry */
+    }
   }
 
   function updateSessionLane(ctx?: ExtensionContext): void {
-    const clock = new Date().toTimeString().slice(0, 5);
+    const now = Date.now();
     if (!ctx) {
-      snapshot.session = { ...snapshot.session, clock, turn: turnCount };
+      updateWorkTime(now);
       return;
     }
     const usage = ctx.getContextUsage?.();
     const percent = usage?.percent ?? null;
-    // Sample context % into the history ring buffer (throttled to ≥2s apart).
-    const now = Date.now();
-    if (percent != null && now - lastHistoryAt >= 2_000) {
-      ctxHistory.push(percent);
-      if (ctxHistory.length > HISTORY_N) ctxHistory.shift();
-      lastHistoryAt = now;
-    }
     const elapsed = sessionStartedAt ? now - sessionStartedAt : 0;
-    const duration = elapsed > 0 ? fmtDuration(elapsed) : undefined;
-    const costRate = fmtCostRate(snapshot.session.costUsd, elapsed);
+    const costRate = fmtCostRate(sessionCostUsd, elapsed);
+    updateWorkTime(now);
     snapshot.session = {
       percent,
       tokens: usage?.tokens ?? null,
       contextWindow: usage?.contextWindow ?? null,
-      clock,
-      turn: turnCount,
-      history: ctxHistory.slice(),
-      duration,
       costRate,
       // Cost and token I/O accumulate from message events; keep whatever we have.
       inputTokens: snapshot.session.inputTokens,
       outputTokens: snapshot.session.outputTokens,
-      costUsd: snapshot.session.costUsd,
+      costUsd: sessionCostUsd,
+      workTimeMs: snapshot.session.workTimeMs,
     };
+  }
+
+  /** Working time: banked segments + the live open segment (when running). */
+  function updateWorkTime(now: number): void {
+    const live = workClockRunning ? now - workClockSince : 0;
+    const total = workedMs + live;
+    snapshot.session.workTimeMs = total > 0 ? total : undefined;
   }
 
   function updateWorkLane(ctx?: ExtensionContext): void {
@@ -371,9 +552,20 @@ export default function (pi: ExtensionAPI) {
     thinkingLevel = ctx.thinkingLevel ?? undefined;
     thinkingOn = !!thinkingLevel && thinkingLevel !== "off";
     sessionStartedAt = Date.now();
-    ctxHistory = [];
-    lastHistoryAt = 0;
+    workClockRunning = false;
+    workClockSince = 0;
+    workedMs = 0;
+    activityLog = [];
+    summaryFingerprint = "";
+    lastSummaryAt = 0;
+    pendingTools.clear();
+    thinkingBuffer = "";
+    snapshot.control.thinkingSummary = undefined;
+    runningSubagents.clear();
+    snapshot.sessions.subagentsRunning = 0;
     lastFingerprint = "";
+    restoreCost(ctx);
+    if (!ctx.isIdle()) resumeWorkClock(); // reloaded mid-turn
     // Lead session role label (Q13).
     snapshot.sessions.me = { ...snapshot.sessions.me, isMe: true, state: "working", role: "orchestrator" };
 
@@ -397,11 +589,15 @@ export default function (pi: ExtensionAPI) {
 
       return {
         render(width: number): string[] {
-          // Compat bridge: unknown setStatus() keys → one transient alert.
+          // Extension statuses → control-row segments. pi-honcho publishes its
+          // connection state here; render it as its own status cell instead of
+          // the generic transient alert. Genuinely unknown keys still surface
+          // as one transient alert (compat bridge).
           if (footerDataRef) {
             const unknowns: string[] = [];
             for (const [key, value] of footerDataRef.getExtensionStatuses()) {
-              if (!KNOWN_STATUS_KEYS.has(key) && value) unknowns.push(value);
+              if (!value) continue;
+              if (!KNOWN_STATUS_KEYS.has(key)) unknowns.push(value);
             }
             snapshot.control.transientAlert = unknowns[0];
           }
@@ -422,7 +618,7 @@ export default function (pi: ExtensionAPI) {
     poller?.dispose();
     poller = startOrcaPolling(pi, (lane, freshness, meta) => updateSessionsLane(lane, freshness, meta));
 
-    updateAgentLane();
+    updateAgentLane(ctx);
     updateSessionLane(ctx);
     updateWorkLane(ctx);
     invalidate(true);
@@ -433,31 +629,91 @@ export default function (pi: ExtensionAPI) {
       invalidate();
     }, 60_000);
     clockTimer.unref?.();
+
   });
+
+  // ── subagent fleet events (pi-subagents) ────────────────────────────────
+
+  const runningSubagents = new Set<string>();
+
+  eventUnsubs.push(
+    pi.events.on("subagents:started", (data) => {
+      const d = data as { id?: string } | undefined;
+      if (!d?.id) return;
+      runningSubagents.add(d.id);
+      snapshot.sessions.subagentsRunning = runningSubagents.size;
+      invalidate();
+    }),
+
+    pi.events.on("subagents:created", (data) => {
+      const d = data as { id?: string } | undefined;
+      if (!d?.id) return;
+      runningSubagents.add(d.id);
+      snapshot.sessions.subagentsRunning = runningSubagents.size;
+      invalidate();
+    }),
+
+    // Terminal events carry the whole run's spend as a pi Usage.
+    pi.events.on("subagents:completed", (data) => {
+      const d = data as { id?: string; usage?: { cost?: { total?: number } } } | undefined;
+      if (!d) return;
+      if (d.id) runningSubagents.delete(d.id);
+      const cost = d.usage?.cost?.total;
+      if (cost != null) {
+        subagentSpendUsd += cost;
+        snapshot.sessions.subagentSpendUsd = subagentSpendUsd;
+        persistCost();
+      }
+      snapshot.sessions.subagentsRunning = runningSubagents.size;
+      invalidate();
+    }),
+
+    pi.events.on("subagents:failed", (data) => {
+      const d = data as { id?: string; usage?: { cost?: { total?: number } } } | undefined;
+      if (!d) return;
+      if (d.id) runningSubagents.delete(d.id);
+      const cost = d.usage?.cost?.total;
+      if (cost != null) {
+        subagentSpendUsd += cost;
+        snapshot.sessions.subagentSpendUsd = subagentSpendUsd;
+        persistCost();
+      }
+      snapshot.sessions.subagentsRunning = runningSubagents.size;
+      invalidate();
+    }),
+  );
 
   // ── agent state machine events ──────────────────────────────────────────
 
   pi.on("agent_start", async (_event, ctx) => {
     if (ctx.mode !== "tui") return;
     activeTools = 0;
+    resumeWorkClock();
     agentState = { kind: "working" };
-    updateAgentLane();
+    void refreshThinkingSummary();
+    updateAgentLane(ctx);
     invalidate();
   });
 
   pi.on("agent_end", async (_event, ctx) => {
     if (ctx.mode !== "tui") return;
+    pauseWorkClock();
+    persistCost(); // bank workedMs at the turn boundary
+    thinkingBuffer = "";
     activeTools = 0;
     agentState = { kind: "idle" };
-    updateAgentLane();
+    updateAgentLane(ctx);
     invalidate();
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
     if (ctx.mode !== "tui") return;
+    pauseWorkClock();
+    persistCost(); // bank workedMs at the settle boundary
+    thinkingBuffer = "";
     activeTools = 0;
     agentState = { kind: "idle" };
-    updateAgentLane();
+    updateAgentLane(ctx);
     invalidate();
   });
 
@@ -467,8 +723,13 @@ export default function (pi: ExtensionAPI) {
     if (!ev) return;
     switch (ev.type) {
       case "thinking_start":
+        thinkingBuffer = "";
+        agentState = { kind: "thinking" };
+        break;
       case "thinking_delta":
         agentState = { kind: "thinking" };
+        thinkingBuffer += typeof ev.delta === "string" ? ev.delta : "";
+        if (thinkingBuffer.length > THINK_BUFFER_MAX) thinkingBuffer = thinkingBuffer.slice(-THINK_BUFFER_MAX);
         break;
       case "text_delta":
         agentState = { kind: "writing" };
@@ -480,14 +741,19 @@ export default function (pi: ExtensionAPI) {
       default:
         return;
     }
-    updateAgentLane();
+    // While thinking, keep the summary fresh (throttled inside).
+    if (agentState.kind === "thinking") void refreshThinkingSummary();
+    updateAgentLane(ctx);
     // Fuse in-flight usage.
     const msg = event.message;
     if (msg && msg.role === "assistant" && msg.usage) {
       const u = msg.usage as { input?: number; output?: number; cost?: { total?: number } };
       snapshot.session.inputTokens = u.input;
       snapshot.session.outputTokens = u.output;
-      if (u.cost?.total != null) snapshot.session.costUsd = u.cost.total;
+      if (u.cost?.total != null && u.cost.total !== sessionCostUsd) {
+        sessionCostUsd = u.cost.total;
+        persistCost();
+      }
     }
     invalidate();
   });
@@ -499,7 +765,10 @@ export default function (pi: ExtensionAPI) {
       const u = msg.usage as { input?: number; output?: number; cost?: { total?: number } };
       snapshot.session.inputTokens = u.input;
       snapshot.session.outputTokens = u.output;
-      if (u.cost?.total != null) snapshot.session.costUsd = u.cost.total;
+      if (u.cost?.total != null && u.cost.total !== sessionCostUsd) {
+        sessionCostUsd = u.cost.total;
+        persistCost();
+      }
       updateSessionLane(ctx);
       invalidate();
     }
@@ -507,9 +776,12 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("tool_execution_start", async (event, ctx) => {
     if (ctx.mode !== "tui") return;
+    if (activeTools === 0) pauseWorkClock(); // tools run: the clock waits
     activeTools++;
+    void refreshThinkingSummary();
     const tool = event.toolName;
     const args = (event.args ?? {}) as Record<string, unknown>;
+    if (event.toolCallId) pendingTools.set(event.toolCallId, { tool, args });
     if (tool === "read") {
       agentState = { kind: "reading", path: truncatePath(args.path) };
     } else if (tool === "write" || tool === "edit") {
@@ -517,17 +789,26 @@ export default function (pi: ExtensionAPI) {
     } else {
       agentState = { kind: "calling-tools", tool };
     }
-    updateAgentLane();
+    updateAgentLane(ctx);
     invalidate();
   });
 
-  pi.on("tool_execution_end", async (_event, ctx) => {
+  pi.on("tool_execution_end", async (event, ctx) => {
     if (ctx.mode !== "tui") return;
     activeTools = Math.max(0, activeTools - 1);
     if (activeTools === 0) {
-      agentState = ctx.isIdle() ? { kind: "idle" } : { kind: "working" };
+      const idle = ctx.isIdle();
+      if (!idle) resumeWorkClock(); // back to model work — never while idle
+      agentState = idle ? { kind: "idle" } : { kind: "working" };
+      void refreshThinkingSummary();
     }
-    updateAgentLane();
+    // Activity digest: successful tool runs only.
+    const pending = event.toolCallId ? pendingTools.get(event.toolCallId) : undefined;
+    if (pending) {
+      pendingTools.delete(event.toolCallId);
+      if (!event.isError) recordActivity(pending.tool, pending.args);
+    }
+    updateAgentLane(ctx);
     invalidate();
   });
 
@@ -543,7 +824,7 @@ export default function (pi: ExtensionAPI) {
     currentModel = event.model?.id;
     currentProvider = (event.model as { provider?: string } | undefined)?.provider ?? process.env.PI_PROVIDER;
     routedModel = undefined; // repopulates from the next prism-routed response
-    updateAgentLane();
+    updateAgentLane(ctx);
     invalidate();
   });
 
@@ -558,7 +839,7 @@ export default function (pi: ExtensionAPI) {
     const routed = event.headers["x-prism-model-name"] ?? event.headers["x-prism-model-id"];
     if (!routed || routed === routedModel) return;
     routedModel = routed;
-    updateAgentLane();
+    updateAgentLane(ctx);
     invalidate();
   });
 
@@ -566,7 +847,7 @@ export default function (pi: ExtensionAPI) {
     if (ctx.mode !== "tui") return;
     thinkingLevel = event.level;
     thinkingOn = !!thinkingLevel && thinkingLevel !== "off";
-    updateAgentLane();
+    updateAgentLane(ctx);
     invalidate();
   });
 

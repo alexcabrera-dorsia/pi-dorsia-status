@@ -1,16 +1,20 @@
 /**
- * dorsia-status — pure five-row status renderer.
+ * dorsia-status — pure four-row status renderer.
  *
- * No I/O. `renderStatus(width, snapshot, theme)` returns exactly 5 strings,
- * one per lane: agent, session, work, sessions, control. Empty segments
- * disappear; rows never collapse (padded to width, never to height).
+ * No I/O. `renderStatus(width, snapshot, theme)` returns exactly 4 strings,
+ * one per row: model, work, fleet, control. Empty segments disappear; rows
+ * never collapse (padded to width, never to height).
+ *
+ * The underlying data model keeps five lanes (agent, session, work, sessions,
+ * control) for segment-bus compatibility; the agent + session lanes merge
+ * onto row 1. Former right-side metadata packs onto the left — the expanding
+ * gap read as dead space.
  *
  * Width fitting per row (fixed-lane packer, no spilling between rows):
- *   1. Lay out left + right anchors first.
- *   2. Add visible segments in descending priority.
- *   3. Too wide → compact then evict optional detail by priority.
- *   4. Compact required state where a useful fallback exists, then shrink-widest.
- *   5. Final guard: truncateToWidth.
+ *   1. Add visible segments in descending priority.
+ *   2. Too wide → compact then evict optional detail by priority.
+ *   3. Compact required state where a useful fallback exists, then shrink-widest.
+ *   4. Final guard: truncateToWidth.
  */
 
 import { hyperlink, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
@@ -59,12 +63,8 @@ export interface SessionLane {
   inputTokens?: number;
   outputTokens?: number;
   costUsd?: number;
-  turn?: number;
-  clock?: string;
-  /** Recent context-% samples (oldest → newest) for the braille sparkline. */
-  history?: number[];
-  /** Session wall-clock duration, e.g. "1h24m". */
-  duration?: string;
+  /** Cumulative time the agent spent working (busy), in ms. */
+  workTimeMs?: number;
   /** Cost burn rate, e.g. "$1.20/hr". */
   costRate?: string;
 }
@@ -109,6 +109,10 @@ export interface SessionsLane {
   me?: SessionInfo;
   siblings: SessionInfo[];
   hiddenCount: number;
+  /** pi-subagents currently running. */
+  subagentsRunning?: number;
+  /** Cumulative spend of completed subagents this session, in USD. */
+  subagentSpendUsd?: number;
 }
 
 export interface ControlLane {
@@ -122,6 +126,8 @@ export interface ControlLane {
   orcaFreshness?: OrcaFreshness;
   /** Unknown legacy setStatus() keys, capped at 1. */
   transientAlert?: string;
+  /** Agentically generated single-sentence summary of what is happening. */
+  thinkingSummary?: string;
   blocker?: string;
 }
 
@@ -231,9 +237,8 @@ function makePairTheme(lane: Lane, _base: StatusTheme): StatusTheme {
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 const BLANK = "";
-/** A light separator within a side; the gap between sides expands to right-align metadata. */
+/** Light separator between segments; also joins the former right block onto the left. */
 const GROUP_SEP = " \u00b7 "; // " · "
-const SIDE_GAP = 2;
 
 /** Map a Tone to the theme color name; "normal" → "text". */
 function toneColor(tone?: Tone): "text" | "dim" | "muted" | "accent" | "success" | "warning" | "error" {
@@ -245,7 +250,7 @@ function toneColor(tone?: Tone): "text" | "dim" | "muted" | "accent" | "success"
  * so producers can't inject line breaks or leak escape params as text.
  * Stripping only control bytes leaves `[48;2;…m` fragments visible when a
  * producer (e.g. pi-background-tasks) embeds raw truecolor codes. */
-function sanitize(s: string | undefined): string {
+export function sanitize(s: string | undefined): string {
   if (!s) return "";
   return s
     .replace(/\x1b\[[0-9;:?<=> \-/]*[@-~]/g, "") // CSI: ESC [ params final
@@ -280,20 +285,15 @@ function segText(seg: Segment, theme: StatusTheme): string {
   return [iconPart, body].filter(Boolean).join(" ");
 }
 
-/** Braille sparkline: 7 levels showing recent context-% history (oldest → newest). */
-const SPARK = ["⣀", "⣄", "⣆", "⣇", "⣧", "⣷", "⣿"];
-const SPARK_N = 8;
+const MIN = 60_000;
+const HOUR = 60 * MIN;
 
-/** Build a braille sparkline from recent context-% samples plus the current value. */
-function contextSpark(percent: number | null, history?: number[]): string {
-  const samples = (history ?? []).slice(-SPARK_N + 1);
-  if (percent != null) samples.push(Math.max(0, Math.min(100, percent)));
-  if (samples.length === 0) return "⣀";
-  // Scale each sample to one of 7 braille levels.
-  return samples.map((p) => {
-    const i = Math.min(SPARK.length - 1, Math.floor((p / 100) * SPARK.length));
-    return SPARK[Math.max(0, i)];
-  }).join("");
+/** Format a millisecond duration compactly, e.g. "42s", "12m", "1h24m". */
+function fmtDuration(ms: number): string {
+  if (ms < MIN) return `${Math.max(1, Math.round(ms / 1000))}s`;
+  const h = Math.floor(ms / HOUR);
+  const m = Math.floor((ms % HOUR) / MIN);
+  return h > 0 ? `${h}h${String(m).padStart(2, "0")}m` : `${m}m`;
 }
 
 function fmtTokens(n: number | null | undefined): string {
@@ -324,8 +324,9 @@ interface PackedSeg {
 
 /**
  * Pack left and right segments into one width-safe row.
- * Optional detail collapses or disappears before required anchors shrink. When
- * both sides survive, the right block is aligned to the final column.
+ * Optional detail collapses or disappears before required anchors shrink.
+ * Both sides pack onto the left: the former right block is appended after the
+ * left block (joined with GROUP_SEP) rather than right-aligned via a gap.
  */
 export function packRow(
   width: number,
@@ -345,7 +346,9 @@ export function packRow(
 
   const blockWidth = (segs: PackedSeg[]): number =>
     segs.reduce((sum, seg) => sum + seg.width, 0) + Math.max(0, segs.length - 1) * visibleWidth(GROUP_SEP);
-  const totalW = (): number => blockWidth(left) + blockWidth(right) + (left.length && right.length ? SIDE_GAP : 0);
+  // Blocks now join with GROUP_SEP instead of an expanding gap.
+  const totalW = (): number =>
+    blockWidth(left) + blockWidth(right) + (left.length && right.length ? visibleWidth(GROUP_SEP) : 0);
   const all = () => [
     ...left.map((seg, index) => ({ seg, side: "left" as const, index })),
     ...right.map((seg, index) => ({ seg, side: "right" as const, index })),
@@ -383,7 +386,12 @@ export function packRow(
     if (!widest) break;
     const overflow = totalW() - width;
     if (widest.width <= overflow) {
-      widest.shrinkable = false;
+      // Stall: no segment can absorb the overflow by shrinking. Evict the
+      // lowest-priority remaining segment — including required ones — so the
+      // final truncation never clips a surviving cell mid-segment.
+      const evict = all().sort((a, b) => a.seg.priority - b.seg.priority)[0];
+      if (!evict) break;
+      (evict.side === "left" ? left : right).splice(evict.index, 1);
       continue;
     }
     widest.text = truncateToWidth(widest.text, Math.max(1, widest.width - overflow));
@@ -393,13 +401,10 @@ export function packRow(
   const dimSep = theme.fg("dim", GROUP_SEP);
   const leftStr = left.map((seg) => seg.text).join(dimSep);
   const rightStr = right.map((seg) => seg.text).join(dimSep);
-  if (!leftStr) {
-    const gap = " ".repeat(Math.max(0, width - visibleWidth(rightStr)));
-    return truncateToWidth(gap + rightStr, width, undefined, true);
-  }
+  // Former right-side metadata appends to the left — no trailing gap, no right anchor.
+  if (!leftStr) return truncateToWidth(rightStr, width, undefined, true);
   if (!rightStr) return truncateToWidth(leftStr, width, undefined, true);
-  const gap = " ".repeat(Math.max(SIDE_GAP, width - visibleWidth(leftStr) - visibleWidth(rightStr)));
-  return truncateToWidth(leftStr + gap + rightStr, width, undefined, true);
+  return truncateToWidth(leftStr + dimSep + rightStr, width, undefined, true);
 }
 
 // ── per-row renderers ───────────────────────────────────────────────────────
@@ -421,7 +426,7 @@ const GLYPH = {
   cost: "\uf155",   // nf-fa-dollar
   turn: "\uf01e",   // nf-fa-rotate (turn)
   clock: "\uf017",  // nf-fa-clock_o
-  duration: "\uf017", // nf-fa-clock_o (session wall-clock)
+  duration: "\uf0e7", // nf-fa-bolt (time spent working)
   model: "\uf2d0",  // nf-oct-cpu (provider/model)
   // work row
   branch: "\uf126", // nf-oct-git_branch
@@ -470,123 +475,6 @@ function stateGlyph(state: AgentLane["state"]): string {
   }
 }
 
-function renderAgentRow(width: number, snap: Snapshot, theme: StatusTheme): string {
-  const a = snap.agent;
-  const tone = stateTone(a.state);
-  const left: Segment[] = [
-    { id: "agent-lane", lane: "agent", icon: GLYPH.agent, tone: "accent", priority: 110, side: "left" },
-    { id: "agent-state", lane: "agent", icon: stateGlyph(a.state), value: a.state.replace(/-/g, " "), tone, priority: 100, side: "left" },
-  ];
-  if (a.activity) {
-    left.push({ id: "agent-activity", lane: "agent", value: a.activity, tone: "muted", priority: 80, side: "left", optional: true });
-  }
-  for (const s of snap.segments.agent) {
-    if (s.side === "left") left.push(s);
-  }
-
-  const right: Segment[] = [];
-  if (a.model) {
-    right.push({ id: "agent-model", lane: "agent", icon: GLYPH.model, value: a.model, tone: "muted", priority: 70, side: "right", optional: true });
-  }
-  if (a.routedModel) {
-    right.push({ id: "agent-prism-routed", lane: "agent", value: `→ ${a.routedModel}`, tone: "muted", priority: 65, side: "right", optional: true });
-  }
-  if (a.thinkingOn && a.thinkingLevel && a.thinkingLevel !== "off") {
-    right.push({ id: "agent-thinking", lane: "agent", icon: GLYPH.thinking, value: a.thinkingLevel, tone: "accent", priority: 60, side: "right", optional: true });
-  }
-  for (const s of snap.segments.agent) {
-    if (s.side === "right") right.push(s);
-  }
-
-  return packRow(width, left, right, theme);
-}
-
-function renderSessionRow(width: number, snap: Snapshot, theme: StatusTheme): string {
-  const s = snap.session;
-  const left: Segment[] = [
-    { id: "session-lane", lane: "session", icon: GLYPH.session, tone: "accent", priority: 110, side: "left" },
-  ];
-  const barTone: Tone = s.percent != null && s.percent >= 90 ? "error" : s.percent != null && s.percent >= 80 ? "warning" : "accent";
-  const percent = s.percent == null ? "" : ` ${Math.round(s.percent)}%`;
-  left.push({ id: "session-ctx", lane: "session", label: "ctx", value: `${contextSpark(s.percent, s.history)}${percent}`, tone: barTone, priority: 100, side: "left", labelOnly: `ctx${percent || " ?"}` });
-  if (s.tokens != null && s.contextWindow) {
-    left.push({ id: "session-tokens", lane: "session", icon: GLYPH.tokens, value: `${fmtTokens(s.tokens)}/${fmtTokens(s.contextWindow)}`, tone: "muted", priority: 85, side: "left", optional: true });
-  }
-  if (s.inputTokens != null || s.outputTokens != null) {
-    const io = `↑${fmtTokens(s.inputTokens)} ↓${fmtTokens(s.outputTokens)}`;
-    left.push({ id: "session-io", lane: "session", label: "io", value: io, tone: "dim", priority: 75, side: "left", optional: true });
-  }
-  for (const seg of snap.segments.session) if (seg.side === "left") left.push(seg);
-
-  const right: Segment[] = [];
-  const cost = fmtCost(s.costUsd);
-  if (cost.text) {
-    right.push({ id: "session-cost", lane: "session", icon: GLYPH.cost, value: cost.text, tone: cost.tone, priority: 80, side: "right", optional: true });
-  }
-  if (s.duration) {
-    right.push({ id: "session-duration", lane: "session", icon: GLYPH.duration, value: s.duration, tone: "dim", priority: 72, side: "right", optional: true });
-  }
-  if (s.costRate) {
-    right.push({ id: "session-costrate", lane: "session", icon: GLYPH.cost, value: s.costRate, tone: "muted", priority: 68, side: "right", optional: true });
-  }
-  if (s.turn != null) {
-    right.push({ id: "session-turn", lane: "session", icon: GLYPH.turn, value: `${s.turn}`, tone: "dim", priority: 60, side: "right", optional: true });
-  }
-  if (s.clock) {
-    right.push({ id: "session-clock", lane: "session", icon: GLYPH.clock, value: s.clock, tone: "dim", priority: 50, side: "right", optional: true });
-  }
-  for (const seg of snap.segments.session) if (seg.side === "right") right.push(seg);
-
-  return packRow(width, left, right, theme);
-}
-
-function renderWorkRow(width: number, snap: Snapshot, theme: StatusTheme): string {
-  const w = snap.work;
-  const left: Segment[] = [
-    { id: "work-lane", lane: "work", icon: GLYPH.work, tone: "accent", priority: 110, side: "left" },
-  ];
-  const ws = sanitize(w.workspace) || sanitize(w.cwdTail);
-  if (ws) {
-    left.push({ id: "work-ws", lane: "work", value: ws, tone: "accent", priority: 100, side: "left" });
-  }
-  if (w.worktreeStatus) {
-    const statusTone: Tone = /^(clean|ready|done|completed)$/i.test(w.worktreeStatus)
-      ? "success"
-      : /^(blocked|error|failed)$/i.test(w.worktreeStatus) ? "error" : "muted";
-    left.push({ id: "work-status", lane: "work", value: w.worktreeStatus, tone: statusTone, priority: 85, side: "left", optional: true });
-  }
-  for (const seg of snap.segments.work) if (seg.side === "left") left.push(seg);
-
-  const right: Segment[] = [];
-  if (w.branch) {
-    const branch = w.branch.replace(/^refs\/heads\//, "");
-    right.push({ id: "work-branch", lane: "work", icon: GLYPH.branch, value: branch, tone: "muted", priority: 90, side: "right", optional: true });
-  }
-  // Git ahead/behind.
-  const ab: string[] = [];
-  if (w.ahead) ab.push(`↑${w.ahead}`);
-  if (w.behind) ab.push(`↓${w.behind}`);
-  if (ab.length) {
-    right.push({ id: "work-ab", lane: "work", value: ab.join(" "), tone: "dim", priority: 88, side: "right", optional: true });
-  }
-  const dirtyParts: string[] = [];
-  if (w.dirtyAdded) dirtyParts.push(`+${w.dirtyAdded}`);
-  if (w.dirtyRemoved) dirtyParts.push(`-${w.dirtyRemoved}`);
-  if (w.dirtyUntracked) dirtyParts.push(`!${w.dirtyUntracked}`);
-  if (dirtyParts.length) {
-    right.push({ id: "work-dirty", lane: "work", value: dirtyParts.join(" "), tone: "warning", priority: 95, side: "right", optional: true });
-  }
-  if (w.prLink) {
-    right.push({ id: "work-pr", lane: "work", icon: GLYPH.pr, value: w.prLink, tone: "accent", priority: 60, side: "right", optional: true, link: w.prUrl });
-  }
-  if (w.linearLink) {
-    right.push({ id: "work-linear", lane: "work", icon: GLYPH.linear, value: w.linearLink, tone: "accent", priority: 55, side: "right", optional: true, link: w.linearUrl });
-  }
-  for (const seg of snap.segments.work) if (seg.side === "right") right.push(seg);
-
-  return packRow(width, left, right, theme);
-}
-
 function sessionStateGlyph(state: string | undefined): { glyph: string; tone: Tone } {
   switch (state) {
     case "working": case "running": return { glyph: "●", tone: "accent" };
@@ -599,120 +487,194 @@ function sessionStateGlyph(state: string | undefined): { glyph: string; tone: To
   }
 }
 
-/** Segment id (sessions lane) that takes over the lead-session role slot:
- *  the live-goal-widget pushes the current goal/task + live agent activity
- *  here (its composeGoalStatus). When present, its value replaces the
- *  "orchestrator" role text and its tone replaces the state tone. */
+/** Segment id (sessions lane) carrying the current goal/task + live agent
+ *  activity, pushed by the live-goal-widget. Renders as a fleet-row segment. */
 export const GOAL_ROLE_SEGMENT_ID = "goal-current";
 
-function renderSessionsRow(width: number, snap: Snapshot, theme: StatusTheme): string {
+function renderModelRow(width: number, snap: Snapshot, theme: StatusTheme): string {
+  const a = snap.agent;
+  const s = snap.session;
+  const left: Segment[] = [];
+
+  // Selected model + thinking level.
+  if (a.model) {
+    left.push({ id: "model-id", lane: "agent", icon: GLYPH.model, value: a.model, tone: "accent", priority: 120, side: "left" });
+  }
+  if (a.routedModel) {
+    left.push({ id: "agent-prism-routed", lane: "agent", value: `→ ${a.routedModel}`, tone: "muted", priority: 118, side: "left", optional: true });
+  }
+  if (a.thinkingOn && a.thinkingLevel && a.thinkingLevel !== "off") {
+    left.push({ id: "model-thinking", lane: "agent", icon: GLYPH.thinking, value: a.thinkingLevel, tone: "muted", priority: 115, side: "left", optional: true });
+  }
+
+  // Context window: percent + token I/O in one cell (tachometer glyph).
+  const barTone: Tone = s.percent != null && s.percent >= 90 ? "error" : s.percent != null && s.percent >= 80 ? "warning" : "accent";
+  const percent = s.percent == null ? "?%" : `${Math.round(s.percent)}%`;
+  const io = s.inputTokens != null || s.outputTokens != null ? ` ↑${fmtTokens(s.inputTokens)} ↓${fmtTokens(s.outputTokens)}` : "";
+  left.push({ id: "session-ctx", lane: "session", icon: GLYPH.session, value: `${percent}${io}`, tone: barTone, priority: 110, side: "left", labelOnly: percent });
+
+  // Cost, time spent working, burn rate. The cost cell is required — it
+  // survives eviction; only extreme truncation cuts it. When subagents have
+  // spent anything, the total folds their spend in and a compact "sub" cell
+  // carries the breakdown:  $0.73 · sub $0.31
+  const subSpend = snap.sessions.subagentSpendUsd ?? 0;
+  const cost = fmtCost((s.costUsd ?? 0) + subSpend || undefined);
+  if (cost.text) {
+    left.push({ id: "session-cost", lane: "session", icon: GLYPH.cost, value: cost.text, tone: cost.tone, priority: 90, side: "left" });
+  }
+  if (subSpend > 0) {
+    left.push({ id: "session-cost-sub", lane: "session", label: "sub", value: `$${subSpend.toFixed(2)}`, tone: "muted", priority: 89, side: "left", optional: true });
+  }
+  if (s.workTimeMs != null && s.workTimeMs > 0) {
+    left.push({ id: "session-worktime", lane: "session", icon: GLYPH.duration, value: fmtDuration(s.workTimeMs), tone: "dim", priority: 85, side: "left", optional: true });
+  }
+  if (s.costRate) {
+    left.push({ id: "session-costrate", lane: "session", icon: GLYPH.cost, value: s.costRate, tone: "muted", priority: 80, side: "left", optional: true });
+  }
+
+  // External segments from the agent + session lanes pack here too.
+  for (const seg of [...snap.segments.agent, ...snap.segments.session]) left.push(seg);
+
+  return packRow(width, left, [], theme);
+}
+
+function renderWorkRow(width: number, snap: Snapshot, theme: StatusTheme): string {
+  const w = snap.work;
+  const left: Segment[] = [];
+
+  // Branch — fall back to cwd tail when detached/no git.
+  if (w.branch) {
+    const branch = w.branch.replace(/^refs\/heads\//, "");
+    left.push({ id: "work-branch", lane: "work", icon: GLYPH.branch, value: branch, tone: "accent", priority: 110, side: "left" });
+  } else if (w.cwdTail) {
+    left.push({ id: "work-cwd", lane: "work", value: sanitize(w.cwdTail), tone: "muted", priority: 110, side: "left" });
+  }
+
+  // Diff footprint.
+  const dirtyParts: string[] = [];
+  if (w.dirtyAdded) dirtyParts.push(`+${w.dirtyAdded}`);
+  if (w.dirtyRemoved) dirtyParts.push(`-${w.dirtyRemoved}`);
+  if (w.dirtyUntracked) dirtyParts.push(`!${w.dirtyUntracked}`);
+  if (dirtyParts.length) {
+    left.push({ id: "work-dirty", lane: "work", value: dirtyParts.join(" "), tone: "warning", priority: 100, side: "left", optional: true });
+  }
+
+  // Position vs upstream.
+  const ab: string[] = [];
+  if (w.ahead) ab.push(`↑${w.ahead}`);
+  if (w.behind) ab.push(`↓${w.behind}`);
+  if (ab.length) {
+    left.push({ id: "work-ab", lane: "work", value: ab.join(" "), tone: "dim", priority: 95, side: "left", optional: true });
+  }
+
+  // Worktree state (Orca-managed or git status word).
+  if (w.worktreeStatus) {
+    const statusTone: Tone = /^(clean|ready|done|completed)$/i.test(w.worktreeStatus)
+      ? "success"
+      : /^(blocked|error|failed)$/i.test(w.worktreeStatus) ? "error" : "muted";
+    left.push({ id: "work-status", lane: "work", value: w.worktreeStatus, tone: statusTone, priority: 90, side: "left", optional: true });
+  }
+
+  // Linked PR + Linear ticket.
+  if (w.prLink) {
+    left.push({ id: "work-pr", lane: "work", icon: GLYPH.pr, value: w.prLink, tone: "accent", priority: 90, side: "left", optional: true, link: w.prUrl });
+  }
+  if (w.linearLink) {
+    left.push({ id: "work-linear", lane: "work", icon: GLYPH.linear, value: w.linearLink, tone: "accent", priority: 85, side: "left", optional: true, link: w.linearUrl });
+  }
+  for (const seg of snap.segments.work) left.push(seg);
+
+  return packRow(width, left, [], theme);
+}
+
+/** Sibling states that count as actively working in the fleet view. */
+const FLEET_ACTIVE_STATES = new Set(["working", "running", "thinking", "calling-tools", "reading", "editing"]);
+
+/** Broad per-sibling summary width — enough to orient, not enough to crowd. */
+const FLEET_SUMMARY_WIDTH = 28;
+
+function renderFleetRow(width: number, snap: Snapshot, theme: StatusTheme): string {
   const s = snap.sessions;
-  const left: Segment[] = [
-    { id: "sessions-lane", lane: "sessions", icon: GLYPH.sessions, tone: "accent", priority: 110, side: "left" },
-  ];
+  const left: Segment[] = [];
 
-  const me = s.me;
-  const goalSeg = snap.segments.sessions.find((seg) => seg.id === GOAL_ROLE_SEGMENT_ID && seg.side === "left");
-  const role = sanitize(goalSeg?.value) || sanitize(me?.role) || "orchestrator";
-  const meState = me ? sessionStateGlyph(me.state) : { glyph: "●", tone: "accent" as Tone };
+  // Headline: how many peers are actively working.
+  const activeCount = s.siblings.filter((sib) => FLEET_ACTIVE_STATES.has(sib.state ?? "")).length;
   left.push({
-    id: "sessions-me", lane: "sessions", icon: GLYPH.me,
-    value: `${role} ${meState.glyph}`, tone: goalSeg?.tone ?? meState.tone, priority: 100, side: "left",
+    id: "fleet-active", lane: "sessions", icon: GLYPH.sessions,
+    value: `${activeCount} active`, tone: activeCount > 0 ? "accent" : "muted", priority: 110, side: "left",
   });
-  for (const seg of snap.segments.sessions) if (seg.side === "left" && seg.id !== GOAL_ROLE_SEGMENT_ID) left.push(seg);
 
-  // Current session stays left; peer tabs form a deliberately right-anchored block.
-  // Siblings show state + type only (no previews, no recency).
-  const right: Segment[] = [];
+  // In-flight delegations from this session.
+  const deleg = snap.control.activeDelegations ?? 0;
+  if (deleg > 0) {
+    left.push({ id: "fleet-deleg", lane: "sessions", icon: GLYPH.deleg, label: "deleg", value: `${deleg}`, tone: "accent", priority: 100, side: "left", optional: true });
+  }
+
+  // pi-subagents: running count (spend shows in the row-1 cost breakdown).
+  const subRunning = s.subagentsRunning ?? 0;
+  if (subRunning > 0) {
+    left.push({ id: "fleet-sub", lane: "sessions", icon: GLYPH.deleg, label: "sub", value: `${subRunning}`, tone: "accent", priority: 98, side: "left", optional: true });
+  }
+
+  // Per-sibling: state glyph + broad summary (title, else last message preview).
   for (const sib of s.siblings.slice(0, 4)) {
     const sg = sessionStateGlyph(sib.state);
     const alias = sib.alias ?? "?";
     const type = sib.agentType ?? "pi";
-    right.push({
+    const summary = sanitize(sib.title) || sanitize(sib.lastAssistantMessagePreview);
+    left.push({
       id: `sessions-sib-${alias}`, lane: "sessions", label: `@${alias}`,
-      value: `${sg.glyph} ${type}`, tone: sg.tone, priority: 80, side: "right", optional: true,
+      value: summary ? `${sg.glyph} ${summary}` : `${sg.glyph} ${type}`,
+      tone: sg.tone, priority: 80, side: "left", optional: true, maxWidth: FLEET_SUMMARY_WIDTH,
     });
   }
   if (s.hiddenCount > 0) {
-    right.push({ id: "sessions-more", lane: "sessions", label: "hidden", value: `+${s.hiddenCount}`, tone: "dim", priority: 50, side: "right", optional: true });
+    left.push({ id: "sessions-more", lane: "sessions", label: "hidden", value: `+${s.hiddenCount}`, tone: "dim", priority: 50, side: "left", optional: true });
   }
-  for (const seg of snap.segments.sessions) if (seg.side === "right" && seg.id !== GOAL_ROLE_SEGMENT_ID) right.push(seg);
+  // External segments (incl. goal-current) pack onto the fleet row.
+  for (const seg of snap.segments.sessions) left.push(seg);
 
-  return packRow(width, left, right, theme);
+  return packRow(width, left, [], theme);
 }
 
 function renderControlRow(width: number, snap: Snapshot, theme: StatusTheme): string {
   const c = snap.control;
-  const left: Segment[] = [
-    { id: "control-lane", lane: "control", icon: GLYPH.control, tone: "accent", priority: 110, side: "left" },
-  ];
+  const left: Segment[] = [];
 
-  // Error/blocker is highest priority sacred.
-  if (c.blocker) {
-    left.push({ id: "control-blocker", lane: "control", icon: GLYPH.blocker, value: c.blocker, tone: "error", priority: 100, side: "left" });
+  // The row carries exactly one thing: a single-sentence summary of what the
+  // agent is doing right now. Each refresh replaces the previous sentence.
+  if (c.thinkingSummary) {
+    left.push({ id: "control-thinking-summary", lane: "control", icon: GLYPH.thinking, value: c.thinkingSummary, tone: "accent", priority: 130, side: "left", maxWidth: 70 });
   }
-  // Transient alert (unknown legacy status), capped at 1.
-  if (c.transientAlert) {
-    left.push({ id: "control-alert", lane: "control", icon: GLYPH.alert, value: c.transientAlert, tone: "warning", priority: 90, side: "left", optional: true });
-  }
-  // Keep progress sacred and let the current subject disappear independently.
-  if (c.todoTotal != null && c.todoTotal > 0) {
-    const done = c.todoDone ?? 0;
-    const tone: Tone = done >= c.todoTotal ? "success" : "accent";
-    const current = c.todoCurrentId == null ? "" : ` #${c.todoCurrentId}`;
-    left.push({ id: "control-todo", lane: "control", icon: GLYPH.todo, value: `${done}/${c.todoTotal}${current}`, tone, priority: 100, side: "left", labelOnly: `${done}/${c.todoTotal}` });
-    if (c.todoCurrentSubject) {
-      left.push({ id: "control-todo-subject", lane: "control", value: c.todoCurrentSubject, tone: "muted", priority: 60, side: "left", optional: true });
-    }
-  }
-  // Active delegations (count only).
-  if (c.activeDelegations != null && c.activeDelegations > 0) {
-    left.push({ id: "control-deleg", lane: "control", icon: GLYPH.deleg, label: "deleg", value: `${c.activeDelegations}`, tone: "accent", priority: 70, side: "left", optional: true });
-  }
-  for (const seg of snap.segments.control) if (seg.side === "left") left.push(seg);
-
-  const right: Segment[] = [];
-  // MCP count.
-  if (c.mcpEnabled != null) {
-    const connected = c.mcpConnected ?? 0;
-    const tone: Tone = connected === c.mcpEnabled && c.mcpEnabled > 0 ? "success" : connected > 0 ? "warning" : "error";
-    right.push({ id: "control-mcp", lane: "control", icon: GLYPH.mcp, label: "mcp", value: `${connected}/${c.mcpEnabled}`, tone, priority: 80, side: "right", optional: true });
-  }
-  // Orca freshness.
-  if (c.orcaFreshness) {
-    const f = c.orcaFreshness;
-    const secs = Math.round(f.ageMs / 1000);
-    right.push({ id: "control-orca", lane: "control", icon: GLYPH.orca, label: "orca", value: `${f.state} ${secs}s`, tone: f.state === "error" ? "error" : f.state === "stale" ? "warning" : "dim", priority: 50, side: "right", optional: true });
-  }
-  for (const seg of snap.segments.control) if (seg.side === "right") right.push(seg);
-
-  return packRow(width, left, right, theme);
+  return packRow(width, left, [], theme);
 }
 
 // ── top-level renderer ──────────────────────────────────────────────────────
 
 /**
- * Render exactly 5 status rows for the given width.
- * Rows: agent, session, work, sessions, control. Always 5 strings, padded to width.
- * Each row is wrapped in its lane background color (full-width color-bar).
+ * Render exactly 4 status rows for the given width.
+ * Rows: model (agent+session lanes), work, fleet (sessions), control. Always 4
+ * strings, padded to width. Each row is wrapped in its lane background color
+ * (full-width color-bar).
  */
 export function renderStatus(width: number, snapshot: Snapshot, theme: StatusTheme): string[] {
   const w = Math.max(1, width);
-  const lanes: Lane[] = ["agent", "session", "work", "sessions", "control"];
+  // Row → lane pairing: the model row reuses the agent pair (the session lane
+  // merged into it); work, fleet, control keep their own pairs.
+  const rowLanes: Lane[] = ["agent", "work", "sessions", "control"];
   const palette = STATUSLINE_THEMES[currentStatuslineTheme];
   // Inner content renders at w-4 to leave room for 2-space padding at both ends.
   const inner = Math.max(1, w - 4);
   // Each row renders with its lane's pair theme so every segment takes the
   // pair's bold fg — one solid coordinated color bar per row.
   const bodies = [
-    renderAgentRow(inner, snapshot, makePairTheme("agent", theme)),
-    renderSessionRow(inner, snapshot, makePairTheme("session", theme)),
+    renderModelRow(inner, snapshot, makePairTheme("agent", theme)),
     renderWorkRow(inner, snapshot, makePairTheme("work", theme)),
-    renderSessionsRow(inner, snapshot, makePairTheme("sessions", theme)),
+    renderFleetRow(inner, snapshot, makePairTheme("sessions", theme)),
     renderControlRow(inner, snapshot, makePairTheme("control", theme)),
   ];
-  return bodies.slice(0, 5).map((body, i) => {
-    const pair = palette.pairs[lanes[i]];
+  return bodies.slice(0, 4).map((body, i) => {
+    const pair = palette.pairs[rowLanes[i]];
     // 2-space padding inside the bar at both ends.
     const padded = `  ${body}  `;
     let row = visibleWidth(padded) <= w ? padded : truncateToWidth(padded, w, undefined, true);
