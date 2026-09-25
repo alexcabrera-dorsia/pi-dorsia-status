@@ -23,7 +23,7 @@ import { existsSync } from "node:fs";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ReadonlyFooterDataProvider } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
 import { emptySnapshot, renderStatus, sanitize, setStatuslineTheme, type Lane, type Segment, type SessionInfo, type SessionsLane, type StatuslineThemeId, type Snapshot, type StatusTheme, STATUSLINE_THEMES } from "./render.ts";
-import { normalizeSessions, startOrcaPolling, type OrcaPoller, type WorktreeMeta } from "./orca.ts";
+import { countUntracked, normalizeSessions, parseDiffShortstat, startOrcaPolling, type OrcaPoller, type WorktreeMeta } from "./orca.ts";
 
 const SEGMENT_CHANNEL = "dorsia-status:segment/v1";
 const SNAPSHOT_REQUEST_CHANNEL = "dorsia-status:request-snapshot/v1";
@@ -301,17 +301,25 @@ export default function (pi: ExtensionAPI) {
   }
 
   // Git ahead/behind cache (Q9). Refreshed asynchronously; read synchronously per render.
-  let gitAbCache: { ref: string; ts: number; result: { ahead: number; behind: number } | null } | null = null;
-  let gitAbInFlight = false;
+  interface GitStatus {
+    ahead: number | null;
+    behind: number | null;
+    added: number;
+    removed: number;
+    untracked: number;
+  }
+  let gitCache: { ref: string; ts: number; result: GitStatus } | null = null;
+  let gitInFlight = false;
 
-  /** Refresh ahead/behind vs upstream asynchronously (pi.exec is async). Reads are sync via gitAbCache. */
-  async function refreshAheadBehind(ctx: ExtensionContext | undefined, branch: string | null | undefined): Promise<void> {
-    if (!ctx || !branch || gitAbInFlight) return;
+  /** Refresh the working-tree footprint and upstream position asynchronously
+   *  (pi.exec is async); reads stay sync through gitCache. */
+  async function refreshGitStatus(ctx: ExtensionContext | undefined, branch: string | null | undefined): Promise<void> {
+    if (!ctx || !branch || gitInFlight) return;
     const cwd = ctx.cwd;
     const ref = `${cwd}:${branch}`;
     const now = Date.now();
-    if (gitAbCache && gitAbCache.ref === ref && now - gitAbCache.ts < 5_000) return;
-    gitAbInFlight = true;
+    if (gitCache && gitCache.ref === ref && now - gitCache.ts < 5_000) return;
+    gitInFlight = true;
     try {
       const count = async (range: string): Promise<number | null> => {
         const r = await pi.exec("git", ["-C", cwd, "rev-list", "--count", range], { timeout: 3000 });
@@ -326,11 +334,25 @@ export default function (pi: ExtensionAPI) {
         ahead = await count(`origin/${branch}..HEAD`);
         behind = await count(`HEAD..origin/${branch}`);
       }
-      gitAbCache = { ref, ts: now, result: ahead == null || behind == null ? null : { ahead, behind } };
+      // Diff footprint vs HEAD (staged + unstaged) plus the untracked count.
+      const diff = await pi.exec("git", ["-C", cwd, "diff", "--shortstat", "HEAD"], { timeout: 3000 });
+      const porcelain = await pi.exec("git", ["-C", cwd, "status", "--porcelain"], { timeout: 3000 });
+      const { added, removed } = parseDiffShortstat(diff.code === 0 ? diff.stdout : "");
+      gitCache = {
+        ref,
+        ts: now,
+        result: {
+          ahead,
+          behind,
+          added,
+          removed,
+          untracked: porcelain.code === 0 ? countUntracked(porcelain.stdout) : 0,
+        },
+      };
     } catch {
-      gitAbCache = { ref, ts: now, result: null };
+      gitCache = { ref, ts: now, result: { ahead: null, behind: null, added: 0, removed: 0, untracked: 0 } };
     } finally {
-      gitAbInFlight = false;
+      gitInFlight = false;
     }
   }
 
@@ -472,22 +494,22 @@ export default function (pi: ExtensionAPI) {
     const meta = poller?.meta;
     const cwdTail = ctx ? ctx.cwd.split("/").filter(Boolean).slice(-2).join("/") : snapshot.work.cwdTail;
     const abBranch = branch ?? snapshot.work.branch;
-    void refreshAheadBehind(ctx, abBranch); // fire-and-forget; reads use the cache below
-    const ab = gitAbCache && gitAbCache.ref === `${ctx?.cwd}:${abBranch}` ? gitAbCache.result : null;
+    void refreshGitStatus(ctx, abBranch); // fire-and-forget; reads use the cache below
+    const git = gitCache && gitCache.ref === `${ctx?.cwd}:${abBranch}` ? gitCache.result : null;
     snapshot.work = {
       workspace: meta?.displayName ?? undefined,
       cwdTail,
       branch: branch ?? undefined,
-      ahead: ab?.ahead,
-      behind: ab?.behind,
+      ahead: git?.ahead ?? undefined,
+      behind: git?.behind ?? undefined,
       worktreeStatus: meta?.status,
       prLink: meta?.prLink,
       prUrl: meta?.prUrl,
       linearLink: meta?.linearLink,
       linearUrl: meta?.linearUrl,
-      dirtyAdded: snapshot.work.dirtyAdded,
-      dirtyRemoved: snapshot.work.dirtyRemoved,
-      dirtyUntracked: snapshot.work.dirtyUntracked,
+      dirtyAdded: git?.added || undefined,
+      dirtyRemoved: git?.removed || undefined,
+      dirtyUntracked: git?.untracked || undefined,
     };
   }
 

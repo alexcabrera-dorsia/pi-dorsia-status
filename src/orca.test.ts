@@ -14,6 +14,8 @@ import { describe, it, expect } from "vitest";
 import {
   normalizeSessions,
   orcaEnv,
+  countUntracked,
+  parseDiffShortstat,
   prFromRaw,
   linearFromRaw,
   type OrcaEnv,
@@ -279,6 +281,35 @@ describe("normalizeSessions: sibling cap (4 shown, rest hidden)", () => {
     const lane = normalizeSessions(terminals, [], ME_ENV, makeAlias());
     expect(lane.siblings).toHaveLength(4);
     expect(lane.hiddenCount).toBe(6);
+  });
+});
+
+// ── Working-tree footprint parsers ──────────────────────────────────────────
+
+describe("parseDiffShortstat / countUntracked", () => {
+  it("parses insertions and deletions from shortstat", () => {
+    expect(parseDiffShortstat(" 3 files changed, 12 insertions(+), 4 deletions(-)")).toEqual({ added: 12, removed: 4 });
+  });
+
+  it("treats a missing side as zero (insertions-only and deletions-only)", () => {
+    expect(parseDiffShortstat(" 1 file changed, 7 insertions(+)")).toEqual({ added: 7, removed: 0 });
+    expect(parseDiffShortstat(" 1 file changed, 2 deletions(-)")).toEqual({ added: 0, removed: 2 });
+  });
+
+  it("returns zeros for empty or unrelated output", () => {
+    expect(parseDiffShortstat("")).toEqual({ added: 0, removed: 0 });
+    expect(parseDiffShortstat("nothing to commit, working tree clean")).toEqual({ added: 0, removed: 0 });
+  });
+
+  it("counts only ?? entries as untracked", () => {
+    const porcelain = [
+      " M src/render.ts",
+      "?? vitest.config.ts",
+      "?? .pi/",
+      "A  src/new.ts",
+    ].join("\n");
+    expect(countUntracked(porcelain)).toBe(2);
+    expect(countUntracked("")).toBe(0);
   });
 });
 

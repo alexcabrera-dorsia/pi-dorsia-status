@@ -75,6 +75,8 @@ export interface RawWorktree {
   name?: string;
   branch?: string;
   status?: string;
+  /** Board column: todo | in-progress | in-review | completed. */
+  workspaceStatus?: string;
   /** Current orca shape: linkedPR: { number, state } (null when unlinked). */
   linkedPR?: { number?: number; state?: string } | null;
   /** GitHub issue/PR number linked via `orca worktree set --issue` (PRs share
@@ -147,6 +149,29 @@ export function prFromRaw(w: RawWorktree, projectIdFallback?: string): { label?:
     return { label: clean };
   }
   return {};
+}
+
+/** Shortstat: " 3 files changed, 12 insertions(+), 4 deletions(-)" → { added, removed }.
+ *  Missing clauses mean zero for that side. */
+export function parseDiffShortstat(out: string): { added: number; removed: number } {
+  const num = (re: RegExp): number => {
+    const m = re.exec(out);
+    const n = m ? Number.parseInt(m[1], 10) : 0;
+    return Number.isSafeInteger(n) && n > 0 ? n : 0;
+  };
+  return {
+    added: num(/(\d+) insertion/),
+    removed: num(/(\d+) deletion/),
+  };
+}
+
+/** Count untracked entries in `git status --porcelain` output. */
+export function countUntracked(porcelain: string): number {
+  let n = 0;
+  for (const line of porcelain.split("\n")) {
+    if (line.startsWith("??")) n++;
+  }
+  return n;
 }
 
 /** Derive Linear display label + URL from legacy string fields. */
@@ -409,7 +434,7 @@ export function startOrcaPolling(
           state.meta = {
             displayName: current.displayName ?? current.name,
             branch: current.branch,
-            status: current.status,
+            status: current.workspaceStatus ?? current.status,
             prLink: pr.label,
             prUrl: pr.url,
             linearLink: linear.label,
@@ -474,7 +499,7 @@ export function startOrcaPolling(
       state.meta = {
         displayName: w.displayName ?? w.name,
         branch: w.branch,
-        status: w.status,
+        status: w.workspaceStatus ?? w.status,
         prLink: pr.label,
         prUrl: pr.url,
         linearLink: linear.label,
