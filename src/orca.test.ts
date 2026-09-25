@@ -17,6 +17,7 @@ import {
   countUntracked,
   parseDiffShortstat,
   prFromRaw,
+  selectCurrentWorktree,
   linearFromRaw,
   type OrcaEnv,
   type RawTerminal,
@@ -281,6 +282,37 @@ describe("normalizeSessions: sibling cap (4 shown, rest hidden)", () => {
     const lane = normalizeSessions(terminals, [], ME_ENV, makeAlias());
     expect(lane.siblings).toHaveLength(4);
     expect(lane.hiddenCount).toBe(6);
+  });
+});
+
+// ── Current-worktree selection from `worktree ps` ───────────────────────────
+
+describe("selectCurrentWorktree", () => {
+  const mine = {
+    worktreeId: "repo-1::/w/task-a",
+    path: "/w/task-a",
+    displayName: "task A",
+    linkedLinearIssue: "ENG-1",
+  };
+  const other = { worktreeId: "repo-1::/w/task-b", path: "/w/task-b", displayName: "task B" };
+
+  it("matches on worktreeId (the field ps records actually carry)", () => {
+    expect(selectCurrentWorktree([other, mine], "repo-1::/w/task-a")).toEqual(mine);
+  });
+
+  it("falls back to the path suffix when the id field is used instead", () => {
+    expect(selectCurrentWorktree([other, mine], "repo-1::/w/task-a")).toEqual(mine);
+    // A `worktree current` style record that carries `id` still matches.
+    const withId = { id: "repo-1::/w/task-a", displayName: "task A" };
+    expect(selectCurrentWorktree([other, withId], "repo-1::/w/task-a")).toEqual(withId);
+  });
+
+  it("returns undefined instead of guessing another worktree", () => {
+    // Regression: the old code fell back to list[0], so metadata (status, PR,
+    // Linear links, agents) described an arbitrary worktree.
+    expect(selectCurrentWorktree([other], "repo-1::/w/task-a")).toBeUndefined();
+    expect(selectCurrentWorktree([], "repo-1::/w/task-a")).toBeUndefined();
+    expect(selectCurrentWorktree([other, mine])).toBeUndefined();
   });
 });
 

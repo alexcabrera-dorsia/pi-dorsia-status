@@ -70,7 +70,13 @@ export interface RawAgent {
 }
 
 export interface RawWorktree {
+  /** Present on `worktree current` records. `worktree ps` records use
+   *  `worktreeId` (composite "repoId::path") instead, so prefer the selector. */
   id?: string;
+  /** `worktree ps` record identity: "repoId::path". */
+  worktreeId?: string;
+  /** Absolute worktree path (present on ps records; used as a fallback match). */
+  path?: string;
   displayName?: string;
   name?: string;
   branch?: string;
@@ -149,6 +155,28 @@ export function prFromRaw(w: RawWorktree, projectIdFallback?: string): { label?:
     return { label: clean };
   }
   return {};
+}
+
+/** Pick this session's worktree record out of a `worktree ps` list.
+ *
+ *  `worktree ps` records carry `worktreeId` ("repoId::path"), not `id`, so an
+ *  id-only match silently missed and every caller fell back to the first
+ *  record — metadata (workspace name, status, PR/Linear links, agents) then
+ *  described whichever worktree happened to sort first. Match on the selector,
+ *  then on the path suffix of the selector, and return undefined rather than
+ *  guessing at another worktree's record. */
+export function selectCurrentWorktree(list: RawWorktree[], worktreeId?: string): RawWorktree | undefined {
+  if (list.length === 0) return undefined;
+  if (worktreeId) {
+    const hit = list.find((w) => w.worktreeId === worktreeId || w.id === worktreeId);
+    if (hit) return hit;
+    const path = worktreeId.includes("::") ? worktreeId.split("::").slice(1).join("::") : undefined;
+    if (path) {
+      const byPath = list.find((w) => w.path === path);
+      if (byPath) return byPath;
+    }
+  }
+  return undefined;
 }
 
 /** Shortstat: " 3 files changed, 12 insertions(+), 4 deletions(-)" → { added, removed }.
@@ -426,7 +454,7 @@ export function startOrcaPolling(
       } else {
         // Find the current worktree's agents.
         const list = Array.isArray(data) ? (data as RawWorktree[]) : Array.isArray((data as { worktrees?: unknown[] })?.worktrees) ? ((data as { worktrees: RawWorktree[] }).worktrees) : [];
-        const current = list.find((w) => env.worktreeId && w.id === env.worktreeId) ?? list[0];
+        const current = selectCurrentWorktree(list, env.worktreeId);
         rawAgents = Array.isArray(current?.agents) ? current.agents : [];
         if (current) {
           const pr = prFromRaw(current, state.projectId);
