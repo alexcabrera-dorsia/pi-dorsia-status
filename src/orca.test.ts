@@ -339,4 +339,31 @@ describe("prFromRaw / linearFromRaw", () => {
     expect(linearFromRaw({ linearIssue: "DOR-45" })).toEqual({ label: "DOR-45" });
     expect(linearFromRaw({})).toEqual({});
   });
+
+  it("prFromRaw: linkedIssue (worktree set --issue) becomes an /issues URL, redirect-safe for PRs", () => {
+    const w = { linkedIssue: 1 };
+    expect(prFromRaw(w, "github:elomi-inc/pi-dorsia-status")).toEqual({
+      label: "#1",
+      url: "https://github.com/elomi-inc/pi-dorsia-status/issues/1",
+    });
+    // linkedPR wins when both are present.
+    expect(prFromRaw({ linkedIssue: 1, linkedPR: { number: 2, state: "open" } }, "github:o/r")).toEqual({
+      label: "#2",
+      url: "https://github.com/o/r/pull/2",
+    });
+  });
+
+  it("linearFromRaw: linkedLinearIssue becomes label + linear.app URL via the org fallback", () => {
+    expect(linearFromRaw({ linkedLinearIssue: "ENG-3250" }, "dorsia")).toEqual({
+      label: "ENG-3250",
+      url: "https://linear.app/dorsia/issue/ENG-3250",
+    });
+    // An explicit organizationUrlKey on the record beats the fallback.
+    expect(linearFromRaw({ linkedLinearIssue: "ENG-3250", linkedLinearIssueOrganizationUrlKey: "acme" })).toEqual({
+      label: "ENG-3250",
+      url: "https://linear.app/acme/issue/ENG-3250",
+    });
+    // No fallback and no record key → label only.
+    expect(linearFromRaw({ linkedLinearIssue: "ENG-3250" })).toEqual({ label: "ENG-3250" });
+  });
 });

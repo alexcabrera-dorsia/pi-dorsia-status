@@ -616,7 +616,9 @@ export default function (pi: ExtensionAPI) {
 
     // Start Orca polling.
     poller?.dispose();
-    poller = startOrcaPolling(pi, (lane, freshness, meta) => updateSessionsLane(lane, freshness, meta));
+    poller = startOrcaPolling(pi, (lane, freshness, meta) => updateSessionsLane(lane, freshness, meta), {
+      linearOrgUrlKey: process.env.PI_LINEAR_ORG_URL_KEY ?? "dorsia",
+    });
 
     updateAgentLane(ctx);
     updateSessionLane(ctx);

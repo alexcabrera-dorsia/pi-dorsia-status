@@ -77,6 +77,13 @@ export interface RawWorktree {
   status?: string;
   /** Current orca shape: linkedPR: { number, state } (null when unlinked). */
   linkedPR?: { number?: number; state?: string } | null;
+  /** GitHub issue/PR number linked via `orca worktree set --issue` (PRs share
+   *  GitHub's issue numbering; set when the PR itself is not detectable). */
+  linkedIssue?: number | null;
+  /** Linear issue identifier linked via `orca worktree set --linear-issue`. */
+  linkedLinearIssue?: string | null;
+  /** Linear workspace url key (e.g. "dorsia"); often absent from metadata. */
+  linkedLinearIssueOrganizationUrlKey?: string | null;
   /** Present on `worktree current` records: e.g. "github:elomi-inc/dorsia-monorepo". */
   projectId?: string;
   repo?: string;
@@ -120,6 +127,17 @@ export function prFromRaw(w: RawWorktree, projectIdFallback?: string): { label?:
       url: m ? `https://github.com/${m[1]}/${m[2]}/pull/${n}` : undefined,
     };
   }
+  // GitHub issue/PR number linked via `orca worktree set --issue`. GitHub
+  // shares numbering between issues and PRs, and /issues/N redirects to the
+  // pull-request view, so the URL is safe for either.
+  if (typeof w.linkedIssue === "number") {
+    const projectId = typeof w.projectId === "string" && w.projectId ? w.projectId : projectIdFallback;
+    const m = typeof projectId === "string" ? /^github:([^/\s]+)\/([^\s]+)$/.exec(projectId.trim()) : null;
+    return {
+      label: `#${w.linkedIssue}`,
+      url: m ? `https://github.com/${m[1]}/${m[2]}/issues/${w.linkedIssue}` : undefined,
+    };
+  }
   const legacy = w.prLink ?? w.pr;
   if (typeof legacy === "string" && legacy.trim()) {
     const clean = legacy.trim();
@@ -132,7 +150,14 @@ export function prFromRaw(w: RawWorktree, projectIdFallback?: string): { label?:
 }
 
 /** Derive Linear display label + URL from legacy string fields. */
-export function linearFromRaw(w: RawWorktree): { label?: string; url?: string } {
+export function linearFromRaw(w: RawWorktree, orgUrlKeyFallback?: string): { label?: string; url?: string } {
+  const identifier = typeof w.linkedLinearIssue === "string" ? w.linkedLinearIssue.trim() : "";
+  if (identifier) {
+    const org = (typeof w.linkedLinearIssueOrganizationUrlKey === "string" && w.linkedLinearIssueOrganizationUrlKey.trim())
+      ? w.linkedLinearIssueOrganizationUrlKey.trim()
+      : orgUrlKeyFallback;
+    return { label: identifier, url: org ? `https://linear.app/${org}/issue/${identifier}` : undefined };
+  }
   const legacy = w.linearLink ?? w.linearIssue;
   if (typeof legacy === "string" && legacy.trim()) {
     const clean = legacy.trim();
@@ -276,7 +301,7 @@ const FRESH_ERROR_MS = 30_000;
 export function startOrcaPolling(
   pi: ExtensionAPI,
   onSnapshot: (sessions: SessionsLane, freshness: OrcaFreshness, meta: WorktreeMeta | undefined) => void,
-  options?: { environment?: string; execImpl?: typeof pi.exec },
+  options?: { environment?: string; execImpl?: typeof pi.exec; linearOrgUrlKey?: string },
 ): OrcaPoller {
   const env = orcaEnv();
   const exec = options?.execImpl ?? ((cmd: string, args: string[], opts?: { timeout?: number }) => pi.exec(cmd, args, opts));
@@ -380,7 +405,7 @@ export function startOrcaPolling(
         rawAgents = Array.isArray(current?.agents) ? current.agents : [];
         if (current) {
           const pr = prFromRaw(current, state.projectId);
-          const linear = linearFromRaw(current);
+          const linear = linearFromRaw(current, options?.linearOrgUrlKey);
           state.meta = {
             displayName: current.displayName ?? current.name,
             branch: current.branch,
@@ -445,7 +470,7 @@ export function startOrcaPolling(
       const w = data as RawWorktree;
       if (typeof w.projectId === "string" && w.projectId) state.projectId = w.projectId;
       const pr = prFromRaw(w);
-      const linear = linearFromRaw(w);
+      const linear = linearFromRaw(w, options?.linearOrgUrlKey);
       state.meta = {
         displayName: w.displayName ?? w.name,
         branch: w.branch,
