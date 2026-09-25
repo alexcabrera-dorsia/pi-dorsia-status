@@ -424,7 +424,7 @@ const GLYPH = {
   // work row
   branch: "\uf126", // nf-oct-git_branch
   pr: "\uf09b",     // nf-fa-github (PR proxy)
-  linear: "\uf0ae", // nf-fa-tasks (Linear/issues)
+  linear: "\uf145", // nf-fa-ticket (Linear issue)
   // fleet row
   sessions: "\uf0c0", // nf-fa-group (peers/tabs)
   deleg: "\uf0ec",  // nf-fa-exchange (delegations)

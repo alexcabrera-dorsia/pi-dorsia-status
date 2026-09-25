@@ -157,6 +157,17 @@ export function prFromRaw(w: RawWorktree, projectIdFallback?: string): { label?:
   return {};
 }
 
+/** Unwrap the Orca CLI JSON envelope. Every command answers with
+ *  `{ id, ok, result }`; the payload lives under `result`. Older builds put it
+ *  at the top level, so a payload without `result` is returned as-is. A failed
+ *  envelope (`ok: false`) throws so callers keep their last good state. */
+export function unwrapOrcaEnvelope(parsed: unknown): unknown {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return parsed;
+  const env = parsed as { ok?: unknown; result?: unknown; error?: unknown };
+  if (env.ok === false) throw new Error(`orca command failed: ${JSON.stringify(env.error ?? env).slice(0, 200)}`);
+  return "result" in env ? env.result : parsed;
+}
+
 /** Pick this session's worktree record out of a `worktree ps` list.
  *
  *  `worktree ps` records carry `worktreeId` ("repoId::path"), not `id`, so an
@@ -403,7 +414,7 @@ export function startOrcaPolling(
     const fullArgs = options?.environment ? [...args, "--environment", options.environment] : args;
     const res = await exec("orca", [...fullArgs, "--json"], { timeout: CALL_TIMEOUT });
     if (res.code !== 0) throw new Error(`orca ${args[0]} exited ${res.code}: ${res.stderr.slice(0, 200)}`);
-    return JSON.parse(res.stdout);
+    return unwrapOrcaEnvelope(JSON.parse(res.stdout));
   }
 
   function publish(): void {
@@ -520,7 +531,8 @@ export function startOrcaPolling(
     try {
       const data = await runOrca(["worktree", "current"]);
       if (state.disposed) return;
-      const w = data as RawWorktree;
+      // `worktree current` nests the record under `worktree`.
+      const w = ((data as { worktree?: RawWorktree } | undefined)?.worktree ?? data) as RawWorktree;
       if (typeof w.projectId === "string" && w.projectId) state.projectId = w.projectId;
       const pr = prFromRaw(w);
       const linear = linearFromRaw(w, options?.linearOrgUrlKey);

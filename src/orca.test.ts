@@ -18,6 +18,7 @@ import {
   parseDiffShortstat,
   prFromRaw,
   selectCurrentWorktree,
+  unwrapOrcaEnvelope,
   linearFromRaw,
   type OrcaEnv,
   type RawTerminal,
@@ -282,6 +283,27 @@ describe("normalizeSessions: sibling cap (4 shown, rest hidden)", () => {
     const lane = normalizeSessions(terminals, [], ME_ENV, makeAlias());
     expect(lane.siblings).toHaveLength(4);
     expect(lane.hiddenCount).toBe(6);
+  });
+});
+
+// ── Orca CLI envelope ──────────────────────────────────────────────────────
+
+describe("unwrapOrcaEnvelope", () => {
+  it("unwraps the { id, ok, result } envelope every command returns", () => {
+    const payload = { worktrees: [{ worktreeId: "r::/w" }] };
+    expect(unwrapOrcaEnvelope({ id: "x", ok: true, result: payload })).toEqual(payload);
+    // Regression: reading the envelope as the payload yielded {} metadata and
+    // empty terminals/worktrees lists.
+    expect((unwrapOrcaEnvelope({ ok: true, result: { worktree: { branch: "main" } } }) as { worktree: { branch: string } }).worktree.branch).toBe("main");
+  });
+
+  it("passes through payloads that are already unwrapped (older builds)", () => {
+    expect(unwrapOrcaEnvelope({ worktrees: [] })).toEqual({ worktrees: [] });
+    expect(unwrapOrcaEnvelope([])).toEqual([]);
+  });
+
+  it("throws on a failed envelope so callers keep their last good state", () => {
+    expect(() => unwrapOrcaEnvelope({ ok: false, error: { message: "not running" } })).toThrow(/orca command failed/);
   });
 });
 
