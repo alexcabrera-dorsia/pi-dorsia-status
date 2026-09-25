@@ -23,7 +23,7 @@ import { existsSync } from "node:fs";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ReadonlyFooterDataProvider } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
 import { emptySnapshot, renderStatus, sanitize, setStatuslineTheme, type Lane, type Segment, type SessionInfo, type SessionsLane, type StatuslineThemeId, type Snapshot, type StatusTheme, STATUSLINE_THEMES } from "./render.ts";
-import { computeEffort } from "./render.ts";
+import { computeEffort, stepActiveWall } from "./render.ts";
 import { countUntracked, normalizeSessions, parseDiffShortstat, startOrcaPolling, type OrcaPoller, type WorktreeMeta } from "./orca.ts";
 
 const SEGMENT_CHANNEL = "dorsia-status:segment/v1";
@@ -141,9 +141,6 @@ export default function (pi: ExtensionAPI) {
   let thinkingLevel: string | undefined;
   let thinkingOn = false;
 
-  // Session wall-clock start (cost rate).
-  let sessionStartedAt = 0;
-
   // Working-time clock: ticks ONLY while the agent is actively thinking or
   // writing inside a turn. Paused while tools execute and while waiting for
   // user input — pure model-work time, nothing else.
@@ -167,13 +164,21 @@ export default function (pi: ExtensionAPI) {
   // session resume keep the totals (in-memory state alone zeroes on reload).
   let sessionCostUsd: number | undefined;
   let subagentSpendUsd = 0;
-  /** Banked working time of completed subagent runs, in ms. */
-  let subagentWorkMs = 0;
+  /** Turn wall time for this session's own lane (model + tools), in ms. */
+  let ownTurnMs = 0;
+  let turnSince = 0;
+  /** Active wall time: spans where at least one lane (us or a subagent) worked. */
+  let activeWallMs = 0;
+  let activeSince: number | null = null;
+  /** Banked working time of completed subagent runs, read from the session
+   *  ledger (pi-subagents' `subagents:record` entries). Reload-proof by
+   *  construction — those entries survive what ours cannot. */
+  let ledgerSubagentMs = 0;
   const COST_ENTRY_TYPE = "dorsia-status:cost";
 
   function persistCost(): void {
     try {
-      pi.appendEntry(COST_ENTRY_TYPE, { sessionCostUsd, subagentSpendUsd, workedMs, subagentWorkMs });
+      pi.appendEntry(COST_ENTRY_TYPE, { sessionCostUsd, subagentSpendUsd, workedMs, ownTurnMs, activeWallMs });
     } catch {
       /* persistence is best effort */
     }
@@ -182,17 +187,17 @@ export default function (pi: ExtensionAPI) {
   /** Restore cost totals from the last persisted custom entry (reload/resume). */
   function restoreCost(ctx: ExtensionContext): void {
     try {
-      const entries = ctx.sessionManager.getEntries() as { type?: string; customType?: string; data?: { sessionCostUsd?: number; subagentSpendUsd?: number; workedMs?: number; subagentWorkMs?: number } }[];
+      const entries = ctx.sessionManager.getEntries() as { type?: string; customType?: string; data?: { sessionCostUsd?: number; subagentSpendUsd?: number; workedMs?: number; ownTurnMs?: number; activeWallMs?: number } }[];
       for (let i = entries.length - 1; i >= 0; i--) {
         const e = entries[i];
         if (e.type === "custom" && e.customType === COST_ENTRY_TYPE && e.data) {
           sessionCostUsd = typeof e.data.sessionCostUsd === "number" ? e.data.sessionCostUsd : undefined;
           subagentSpendUsd = typeof e.data.subagentSpendUsd === "number" ? e.data.subagentSpendUsd : 0;
           workedMs = typeof e.data.workedMs === "number" ? e.data.workedMs : 0;
-          subagentWorkMs = typeof e.data.subagentWorkMs === "number" ? e.data.subagentWorkMs : 0;
+          ownTurnMs = typeof e.data.ownTurnMs === "number" ? e.data.ownTurnMs : 0;
+          activeWallMs = typeof e.data.activeWallMs === "number" ? e.data.activeWallMs : 0;
           snapshot.session.costUsd = sessionCostUsd;
           snapshot.sessions.subagentSpendUsd = subagentSpendUsd;
-          snapshot.sessions.subagentWorkMs = subagentWorkMs > 0 ? subagentWorkMs : undefined;
           snapshot.session.workTimeMs = workedMs > 0 ? workedMs : undefined;
           return;
         }
@@ -478,8 +483,10 @@ export default function (pi: ExtensionAPI) {
     }
     const usage = ctx.getContextUsage?.();
     const percent = usage?.percent ?? null;
-    const elapsed = sessionStartedAt ? now - sessionStartedAt : 0;
-    const costRate = fmtCostRate(sessionCostUsd, elapsed);
+    // Burn rate over ACTIVE time, not session age: the denominator must not
+    // restart on every reload while the numerator persists.
+    const activeWall = activeWallMs + (activeSince !== null ? now - activeSince : 0);
+    const costRate = fmtCostRate(totalSpendUsd(), activeWall);
     updateWorkTime(now);
     snapshot.session = {
       percent,
@@ -494,20 +501,29 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
-  /** Working time for this session's own model work: banked + the live segment. */
+  /** Two different time measures, deliberately:
+   *  - `workTimeMs` (row 1) is model-only time: thinking and writing, tool
+   *    waits excluded. It answers "how long was I generating?".
+   *  - the effort multiplier (row 3) uses LANE-SECONDS over active wall time,
+   *    so own turns and subagent runs share one unit and can be summed. */
   function updateWorkTime(now: number): void {
     const live = workClockRunning ? now - workClockSince : 0;
-    const ownTotal = workedMs + live;
-    snapshot.session.workTimeMs = ownTotal > 0 ? ownTotal : undefined;
+    const ownModelMs = workedMs + live;
+    snapshot.session.workTimeMs = ownModelMs > 0 ? ownModelMs : undefined;
 
-    // Delegated effort: banked subagent time plus every in-flight run's elapsed.
+    const ownLaneMs = ownTurnMs + (turnSince ? now - turnSince : 0);
     let subLive = 0;
-    for (const startedAt of runningSubagents.values()) subLive += Math.max(0, now - startedAt);
-    const subTotal = subagentWorkMs + subLive;
-    snapshot.sessions.subagentWorkMs = subTotal > 0 ? subTotal : undefined;
+    for (const s of subagents.values()) if (s.startedAt) subLive += Math.max(0, now - s.startedAt);
+    const subLaneMs = ledgerSubagentMs + subLive;
+    snapshot.sessions.subagentWorkMs = subLaneMs > 0 ? subLaneMs : undefined;
 
-    const wall = sessionStartedAt ? now - sessionStartedAt : 0;
-    snapshot.sessions.effortMultiplier = computeEffort(ownTotal, subTotal, wall).multiplier;
+    const activeWall = activeWallMs + (activeSince !== null ? now - activeSince : 0);
+    snapshot.sessions.effortMultiplier = computeEffort(ownLaneMs, subLaneMs, activeWall).multiplier;
+  }
+
+  /** Total spend across this session and everything it delegated. */
+  function totalSpendUsd(): number {
+    return (sessionCostUsd ?? 0) + subagentSpendUsd;
   }
 
   function updateWorkLane(ctx?: ExtensionContext): void {
@@ -603,22 +619,31 @@ export default function (pi: ExtensionAPI) {
     routedModel = undefined;
     thinkingLevel = ctx.thinkingLevel ?? undefined;
     thinkingOn = !!thinkingLevel && thinkingLevel !== "off";
-    sessionStartedAt = Date.now();
     workClockRunning = false;
     workClockSince = 0;
     workedMs = 0;
+    ownTurnMs = 0;
+    turnSince = 0;
+    activeWallMs = 0;
+    activeSince = null;
     activityLog = [];
     summaryFingerprint = "";
     lastSummaryAt = 0;
     pendingTools.clear();
     thinkingBuffer = "";
     snapshot.control.thinkingSummary = undefined;
-    runningSubagents.clear();
+    subagents.clear();
     snapshot.sessions.subagentsRunning = 0;
-    subagentWorkMs = 0;
     lastFingerprint = "";
-    restoreCost(ctx);
-    if (!ctx.isIdle()) resumeWorkClock(); // reloaded mid-turn
+    activeCtx = ctx;
+    ctxGeneration++;
+    restoreCost(ctx);          // our own accumulators (cost, work clock, lane time)
+    refreshLedger();           // delegated time, from pi-subagents' own records
+    if (!ctx.isIdle()) {
+      turnSince = Date.now();  // reloaded mid-turn: reopen our lane
+      resumeWorkClock();
+      stepWall(Date.now());
+    }
     // Lead session role label (Q13).
     snapshot.sessions.me = { ...snapshot.sessions.me, isMe: true, state: "working", role: "orchestrator" };
 
@@ -680,6 +705,7 @@ export default function (pi: ExtensionAPI) {
 
     // Clock tick: once a minute.
     clockTimer = setInterval(() => {
+      refreshLedger();
       updateSessionLane();
       invalidate();
     }, 60_000);
@@ -697,66 +723,106 @@ export default function (pi: ExtensionAPI) {
 
   // ── subagent fleet events (pi-subagents) ────────────────────────────────
 
-  /** Running subagent ids → local start time, for live delegated effort. */
-  const runningSubagents = new Map<string, number>();
+  /** Known subagents by id. `startedAt` is set only once the agent is actually
+   *  running — `subagents:created` fires for queued agents, whose queue wait
+   *  must not count as work. */
+  const subagents = new Map<string, { startedAt?: number }>();
+
+  /** Session context for ledger reads, guarded against post-reload staleness. */
+  let activeCtx: ExtensionContext | undefined;
+  let ctxGeneration = 0;
+
+  function refreshLedger(): void {
+    if (!activeCtx) return;
+    refreshLedgerSubagentMs(activeCtx);
+  }
+
+  /** pi-subagents appends its record entry just after emitting the event, so
+   *  retry once — guarded by generation so a reload cannot resurrect old ctx. */
+  function refreshLedgerSoon(): void {
+    const gen = ctxGeneration;
+    setTimeout(() => {
+      if (gen !== ctxGeneration) return;
+      refreshLedger();
+      invalidate();
+    }, 3_000).unref?.();
+  }
+
+  /** Banked delegated work from pi-subagents' own ledger: it appends a
+   *  `subagents:record` entry (startedAt/completedAt) on every completion. */
+  function refreshLedgerSubagentMs(ctx: ExtensionContext | undefined): void {
+    if (!ctx) return;
+    try {
+      let total = 0;
+      const entries = ctx.sessionManager.getEntries() as { type?: string; customType?: string; data?: { startedAt?: number; completedAt?: number } }[];
+      for (const e of entries) {
+        if (e.type !== "custom" || e.customType !== "subagents:record" || !e.data) continue;
+        const { startedAt, completedAt } = e.data;
+        if (typeof startedAt === "number" && typeof completedAt === "number" && completedAt > startedAt) {
+          total += completedAt - startedAt;
+        }
+      }
+      ledgerSubagentMs = total;
+    } catch {
+      /* keep the last known value */
+    }
+  }
+
+  /** Lanes working right now: this session's turn, plus each running subagent. */
+  function laneCount(): number {
+    let running = 0;
+    for (const s of subagents.values()) if (s.startedAt) running++;
+    return (turnSince ? 1 : 0) + running;
+  }
+
+  /** Open or close the active-wall span as lanes start and finish. */
+  function stepWall(now: number): void {
+    const next = stepActiveWall({ activeMs: activeWallMs, since: activeSince }, laneCount(), now);
+    activeWallMs = next.activeMs;
+    activeSince = next.since;
+  }
+
+  const finishSubagent = (data: unknown) => {
+    const d = data as { id?: string; usage?: { cost?: { total?: number } } } | undefined;
+    if (!d) return;
+    if (d.id) subagents.delete(d.id);
+    const cost = d.usage?.cost?.total;
+    if (cost != null) {
+      subagentSpendUsd += cost;
+      snapshot.sessions.subagentSpendUsd = subagentSpendUsd;
+    }
+    // Working time comes from pi-subagents' own ledger entry, not ours.
+    refreshLedger();
+    refreshLedgerSoon();
+    stepWall(Date.now());
+    snapshot.sessions.subagentsRunning = subagents.size;
+    if (cost != null) persistCost();
+    invalidate();
+  };
 
   eventUnsubs.push(
-    pi.events.on("subagents:started", (data) => {
-      const d = data as { id?: string } | undefined;
-      if (!d?.id) return;
-      if (!runningSubagents.has(d.id)) runningSubagents.set(d.id, Date.now());
-      snapshot.sessions.subagentsRunning = runningSubagents.size;
-      invalidate();
-    }),
-
+    // `created` fires when the record is made. A queued agent has not started,
+    // so it counts toward the fleet total but opens no lane and accrues no work.
     pi.events.on("subagents:created", (data) => {
       const d = data as { id?: string } | undefined;
       if (!d?.id) return;
-      if (!runningSubagents.has(d.id)) runningSubagents.set(d.id, Date.now());
-      snapshot.sessions.subagentsRunning = runningSubagents.size;
+      if (!subagents.has(d.id)) subagents.set(d.id, {});
+      snapshot.sessions.subagentsRunning = subagents.size;
       invalidate();
     }),
 
-    // Terminal events carry the whole run's spend as a pi Usage.
-    pi.events.on("subagents:completed", (data) => {
-      const d = data as { id?: string; usage?: { cost?: { total?: number } }; durationMs?: number } | undefined;
-      if (!d) return;
-      const startedAt = d.id ? runningSubagents.get(d.id) : undefined;
-      if (d.id) runningSubagents.delete(d.id);
-      // The event's durationMs is the run's own measure; fall back to our clock.
-      const ranMs = typeof d.durationMs === "number" && d.durationMs > 0
-        ? d.durationMs
-        : (startedAt != null ? Math.max(0, Date.now() - startedAt) : 0);
-      if (ranMs > 0) subagentWorkMs += ranMs;
-      const cost = d.usage?.cost?.total;
-      if (cost != null) {
-        subagentSpendUsd += cost;
-        snapshot.sessions.subagentSpendUsd = subagentSpendUsd;
-      }
-      if (cost != null || ranMs > 0) persistCost();
-      snapshot.sessions.subagentsRunning = runningSubagents.size;
+    // `started` fires when the agent actually runs (including out of a queue).
+    pi.events.on("subagents:started", (data) => {
+      const d = data as { id?: string } | undefined;
+      if (!d?.id) return;
+      subagents.set(d.id, { startedAt: Date.now() });
+      snapshot.sessions.subagentsRunning = subagents.size;
+      stepWall(Date.now());
       invalidate();
     }),
 
-    pi.events.on("subagents:failed", (data) => {
-      const d = data as { id?: string; usage?: { cost?: { total?: number } }; durationMs?: number } | undefined;
-      if (!d) return;
-      const startedAt = d.id ? runningSubagents.get(d.id) : undefined;
-      if (d.id) runningSubagents.delete(d.id);
-      // The event's durationMs is the run's own measure; fall back to our clock.
-      const ranMs = typeof d.durationMs === "number" && d.durationMs > 0
-        ? d.durationMs
-        : (startedAt != null ? Math.max(0, Date.now() - startedAt) : 0);
-      if (ranMs > 0) subagentWorkMs += ranMs;
-      const cost = d.usage?.cost?.total;
-      if (cost != null) {
-        subagentSpendUsd += cost;
-        snapshot.sessions.subagentSpendUsd = subagentSpendUsd;
-      }
-      if (cost != null || ranMs > 0) persistCost();
-      snapshot.sessions.subagentsRunning = runningSubagents.size;
-      invalidate();
-    }),
+    pi.events.on("subagents:completed", finishSubagent),
+    pi.events.on("subagents:failed", finishSubagent),
   );
 
   // ── agent state machine events ──────────────────────────────────────────
@@ -765,6 +831,8 @@ export default function (pi: ExtensionAPI) {
     if (ctx.mode !== "tui") return;
     activeTools = 0;
     resumeWorkClock();
+    if (!turnSince) turnSince = Date.now();
+    stepWall(Date.now());
     agentState = { kind: "working" };
     void refreshThinkingSummary();
     updateAgentLane(ctx);
@@ -774,7 +842,12 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_end", async (_event, ctx) => {
     if (ctx.mode !== "tui") return;
     pauseWorkClock();
-    persistCost(); // bank workedMs at the turn boundary
+    if (turnSince) {
+      ownTurnMs += Date.now() - turnSince;
+      turnSince = 0;
+    }
+    stepWall(Date.now());
+    persistCost(); // bank workedMs, ownTurnMs and activeWallMs at the boundary
     thinkingBuffer = "";
     activeTools = 0;
     agentState = { kind: "idle" };
@@ -785,7 +858,12 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_settled", async (_event, ctx) => {
     if (ctx.mode !== "tui") return;
     pauseWorkClock();
-    persistCost(); // bank workedMs at the settle boundary
+    if (turnSince) {
+      ownTurnMs += Date.now() - turnSince;
+      turnSince = 0;
+    }
+    stepWall(Date.now());
+    persistCost(); // bank workedMs, ownTurnMs and activeWallMs at the boundary
     thinkingBuffer = "";
     activeTools = 0;
     agentState = { kind: "idle" };
@@ -993,6 +1071,8 @@ export default function (pi: ExtensionAPI) {
       clearInterval(summaryTimer);
       summaryTimer = undefined;
     }
+    activeCtx = undefined;
+    ctxGeneration++;
     poller?.dispose();
     poller = undefined;
     segmentStore.clear();

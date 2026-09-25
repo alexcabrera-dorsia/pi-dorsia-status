@@ -28,6 +28,7 @@ import {
   renderStatus,
   packRow,
   computeEffort,
+  stepActiveWall,
   emptySnapshot,
   GOAL_ROLE_SEGMENT_ID,
   LANE_PAIR,
@@ -924,5 +925,64 @@ describe("sanitize strips whole ANSI sequences from producer segments", () => {
     expect(control).not.toContain("[38;2;");
     expect(control).not.toContain("[0m");
     expect(control).not.toMatch(/\x1b/);
+  });
+});
+
+// ── Effort accounting: lane-seconds over active wall time ───────────────────
+
+describe("computeEffort", () => {
+  it("sums own and delegated lane time into total effort", () => {
+    expect(computeEffort(30 * 60_000, 90 * 60_000, 60 * 60_000)).toEqual({
+      totalMs: 120 * 60_000,
+      multiplier: 2,
+    });
+  });
+
+  it("reports 1.0 for serial work and higher for parallel work", () => {
+    expect(computeEffort(60 * 60_000, 0, 60 * 60_000).multiplier).toBe(1);
+    expect(computeEffort(60 * 60_000, 180 * 60_000, 60 * 60_000).multiplier).toBe(4);
+  });
+
+  it("withholds the multiplier until a minute of active time has passed", () => {
+    expect(computeEffort(30_000, 30_000, 30_000).multiplier).toBeUndefined();
+    expect(computeEffort(30_000, 30_000, 30_000).totalMs).toBe(60_000);
+  });
+
+  it("treats negative inputs as zero", () => {
+    expect(computeEffort(-5, -5, 60_000).totalMs).toBe(0);
+  });
+});
+
+describe("stepActiveWall", () => {
+  it("opens a span when lanes appear and banks it when they finish", () => {
+    let s: { activeMs: number; since: number | null } = { activeMs: 0, since: null };
+    s = stepActiveWall(s, 1, 1_000);          // first lane starts
+    expect(s).toEqual({ activeMs: 0, since: 1_000 });
+    s = stepActiveWall(s, 2, 1_500);          // second lane joins: span continues
+    expect(s).toEqual({ activeMs: 0, since: 1_000 });
+    s = stepActiveWall(s, 0, 4_000);          // last lane ends
+    expect(s).toEqual({ activeMs: 3_000, since: null });
+  });
+
+  it("accumulates across separate spans and ignores idle gaps", () => {
+    let s: { activeMs: number; since: number | null } = { activeMs: 0, since: null };
+    s = stepActiveWall(s, 1, 0);
+    s = stepActiveWall(s, 0, 10_000);         // 10s active
+    s = stepActiveWall(s, 0, 60_000);         // long idle gap: no change
+    s = stepActiveWall(s, 3, 60_000);
+    s = stepActiveWall(s, 0, 65_000);         // +5s
+    expect(s.activeMs).toBe(15_000);
+  });
+
+  it("is idempotent for repeated calls at the same lane count", () => {
+    const open = stepActiveWall({ activeMs: 0, since: 0 }, 2, 500);
+    expect(stepActiveWall(open, 2, 900)).toEqual(open);
+    const closed = stepActiveWall({ activeMs: 100, since: null }, 0, 900);
+    expect(stepActiveWall(closed, 0, 5_000)).toEqual(closed);
+  });
+
+  it("never banks negative time", () => {
+    const s = stepActiveWall({ activeMs: 50, since: 1_000 }, 0, 400);
+    expect(s.activeMs).toBe(50);
   });
 });

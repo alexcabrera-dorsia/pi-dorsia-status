@@ -589,6 +589,17 @@ function renderWorkRow(width: number, snap: Snapshot, theme: StatusTheme): strin
   return packRow(width, left, [], theme);
 }
 
+/** Advance an active-wall accumulator: bank the open span when the lane count
+ *  hits zero, open a new span when it rises above zero. Lane count = own turn
+ *  active + running subagents. State is { activeMs, since }. */
+export function stepActiveWall(state: { activeMs: number; since: number | null }, lanes: number, now: number): { activeMs: number; since: number | null } {
+  // `since: null` is the closed sentinel — a numeric 0 would be a valid
+  // timestamp, so zero cannot mean "no open span".
+  if (lanes > 0 && state.since === null) return { ...state, since: now };
+  if (lanes === 0 && state.since !== null) return { activeMs: state.activeMs + Math.max(0, now - state.since), since: null };
+  return state;
+}
+
 /** Effort accounting: own work + delegated work against wall-clock time.
  *  The multiplier is how many agent-hours were spent per wall-clock hour, so
  *  1.0 means a single serial worker and 2.4 means 2.4 workers' worth of effort
@@ -632,7 +643,10 @@ function renderFleetRow(width: number, snap: Snapshot, theme: StatusTheme): stri
   }
   // Effort multiplier: total agent work ÷ wall-clock time, i.e. average
   // parallelism across this session.
-  if (s.effortMultiplier != null && s.effortMultiplier >= 0.05) {
+  // Lane-seconds ÷ active wall seconds: 1.0 is strictly serial, 2.4 means
+  // 2.4 agents' worth of work was in flight on average. Only shown when real
+  // parallelism happened — solo work and idle sessions stay quiet.
+  if (s.effortMultiplier != null && s.effortMultiplier >= 1.05) {
     left.push({ id: "fleet-multiplier", lane: "sessions", icon: GLYPH.duration, value: `×${s.effortMultiplier.toFixed(1)}`, tone: s.effortMultiplier >= 2 ? "accent" : "dim", priority: 96, side: "left", optional: true });
   }
 
