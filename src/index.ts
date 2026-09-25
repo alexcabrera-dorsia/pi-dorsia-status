@@ -23,6 +23,7 @@ import { existsSync } from "node:fs";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ReadonlyFooterDataProvider } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
 import { emptySnapshot, renderStatus, sanitize, setStatuslineTheme, type Lane, type Segment, type SessionInfo, type SessionsLane, type StatuslineThemeId, type Snapshot, type StatusTheme, STATUSLINE_THEMES } from "./render.ts";
+import { computeEffort } from "./render.ts";
 import { countUntracked, normalizeSessions, parseDiffShortstat, startOrcaPolling, type OrcaPoller, type WorktreeMeta } from "./orca.ts";
 
 const SEGMENT_CHANNEL = "dorsia-status:segment/v1";
@@ -166,11 +167,13 @@ export default function (pi: ExtensionAPI) {
   // session resume keep the totals (in-memory state alone zeroes on reload).
   let sessionCostUsd: number | undefined;
   let subagentSpendUsd = 0;
+  /** Banked working time of completed subagent runs, in ms. */
+  let subagentWorkMs = 0;
   const COST_ENTRY_TYPE = "dorsia-status:cost";
 
   function persistCost(): void {
     try {
-      pi.appendEntry(COST_ENTRY_TYPE, { sessionCostUsd, subagentSpendUsd, workedMs });
+      pi.appendEntry(COST_ENTRY_TYPE, { sessionCostUsd, subagentSpendUsd, workedMs, subagentWorkMs });
     } catch {
       /* persistence is best effort */
     }
@@ -179,15 +182,17 @@ export default function (pi: ExtensionAPI) {
   /** Restore cost totals from the last persisted custom entry (reload/resume). */
   function restoreCost(ctx: ExtensionContext): void {
     try {
-      const entries = ctx.sessionManager.getEntries() as { type?: string; customType?: string; data?: { sessionCostUsd?: number; subagentSpendUsd?: number; workedMs?: number } }[];
+      const entries = ctx.sessionManager.getEntries() as { type?: string; customType?: string; data?: { sessionCostUsd?: number; subagentSpendUsd?: number; workedMs?: number; subagentWorkMs?: number } }[];
       for (let i = entries.length - 1; i >= 0; i--) {
         const e = entries[i];
         if (e.type === "custom" && e.customType === COST_ENTRY_TYPE && e.data) {
           sessionCostUsd = typeof e.data.sessionCostUsd === "number" ? e.data.sessionCostUsd : undefined;
           subagentSpendUsd = typeof e.data.subagentSpendUsd === "number" ? e.data.subagentSpendUsd : 0;
           workedMs = typeof e.data.workedMs === "number" ? e.data.workedMs : 0;
+          subagentWorkMs = typeof e.data.subagentWorkMs === "number" ? e.data.subagentWorkMs : 0;
           snapshot.session.costUsd = sessionCostUsd;
           snapshot.sessions.subagentSpendUsd = subagentSpendUsd;
+          snapshot.sessions.subagentWorkMs = subagentWorkMs > 0 ? subagentWorkMs : undefined;
           snapshot.session.workTimeMs = workedMs > 0 ? workedMs : undefined;
           return;
         }
@@ -208,8 +213,13 @@ export default function (pi: ExtensionAPI) {
   let summaryFingerprint = "";
   let lastSummaryAt = 0;
   let summaryInFlight = false;
-  const SUMMARY_MIN_INTERVAL_MS = 45_000;
+  // Continuous-refresh cadence: the ticker probes every SUMMARY_TICK_MS and the
+  // throttle gates actual spawns, so the sentence tracks the reasoning stream
+  // at roughly one refresh per interval while a turn is active.
+  const SUMMARY_MIN_INTERVAL_MS = 10_000;
+  const SUMMARY_TICK_MS = 5_000;
   const SUMMARY_MODEL = process.env.PI_STATUS_SUMMARY_MODEL ?? "hyper/glm-5.3-flash";
+  let summaryTimer: ReturnType<typeof setInterval> | undefined;
 
   /** The hyper provider ships as a pi package (extension) — locate it so the
    *  headless summary run can load JUST that provider (fast, no other
@@ -261,8 +271,10 @@ export default function (pi: ExtensionAPI) {
   }
 
   /** Refresh the row-4 thinking summary with a cheap headless one-shot model
-   *  run while the agent thinks. Fire-and-forget: keeps the previous text on
-   *  failure, throttled and change-gated so it never burns tokens needlessly. */
+   *  run while the agent works — fired both from agent events and from a
+   *  ticker so the sentence keeps pace with the reasoning stream. throttled
+   *  (SUMMARY_MIN_INTERVAL_MS), change-gated, and never overlaps itself; keeps
+   *  the previous text on failure and does nothing while idle. */
   async function refreshThinkingSummary(): Promise<void> {
     if (summaryInFlight) return;
     if (agentState.kind === "idle") return; // only while a turn is active
@@ -283,7 +295,7 @@ export default function (pi: ExtensionAPI) {
       ];
       if (hyperExtAvailable) args.push("--no-extensions", "-e", HYPER_PROVIDER_EXT);
       args.push("--", buildSummaryPrompt());
-      const result = await pi.exec("pi", args, { timeout: 90_000 });
+      const result = await pi.exec("pi", args, { timeout: 30_000 });
       if (result.code === 0) {
         const line = sanitize(result.stdout.split("\n").find((l) => l.trim()) ?? "");
         if (line) {
@@ -403,7 +415,7 @@ export default function (pi: ExtensionAPI) {
       w.ahead ?? "", w.behind ?? "", w.prLink ?? "", w.prUrl ?? "",
       w.linearLink ?? "", w.linearUrl ?? "",
       ss.siblings.length, ss.hiddenCount, ss.me?.role ?? "",
-      ss.subagentsRunning ?? "", ss.subagentSpendUsd ?? "",
+      ss.subagentsRunning ?? "", ss.subagentSpendUsd ?? "", ss.subagentWorkMs ?? "", ss.effortMultiplier ?? "",
       c.thinkingSummary ?? "",
       c.todoDone ?? "", c.todoTotal ?? "", c.activeDelegations ?? "",
       c.mcpConnected ?? "", c.mcpEnabled ?? "",
@@ -482,11 +494,20 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
-  /** Working time: banked segments + the live open segment (when running). */
+  /** Working time for this session's own model work: banked + the live segment. */
   function updateWorkTime(now: number): void {
     const live = workClockRunning ? now - workClockSince : 0;
-    const total = workedMs + live;
-    snapshot.session.workTimeMs = total > 0 ? total : undefined;
+    const ownTotal = workedMs + live;
+    snapshot.session.workTimeMs = ownTotal > 0 ? ownTotal : undefined;
+
+    // Delegated effort: banked subagent time plus every in-flight run's elapsed.
+    let subLive = 0;
+    for (const startedAt of runningSubagents.values()) subLive += Math.max(0, now - startedAt);
+    const subTotal = subagentWorkMs + subLive;
+    snapshot.sessions.subagentWorkMs = subTotal > 0 ? subTotal : undefined;
+
+    const wall = sessionStartedAt ? now - sessionStartedAt : 0;
+    snapshot.sessions.effortMultiplier = computeEffort(ownTotal, subTotal, wall).multiplier;
   }
 
   function updateWorkLane(ctx?: ExtensionContext): void {
@@ -514,7 +535,16 @@ export default function (pi: ExtensionAPI) {
   }
 
   function updateSessionsLane(lane: SessionsLane, freshness: { ageMs: number; state: "fresh" | "stale" | "error" }, meta?: WorktreeMeta): void {
-    snapshot.sessions = lane;
+    // The poller's lane carries peers only — keep the subagent stats, which it
+    // never knows about. Replacing wholesale erased sub N / sub $X within one
+    // poll cycle, which is why those cells flickered and vanished.
+    snapshot.sessions = {
+      ...lane,
+      subagentsRunning: snapshot.sessions.subagentsRunning,
+      subagentSpendUsd: snapshot.sessions.subagentSpendUsd,
+      subagentWorkMs: snapshot.sessions.subagentWorkMs,
+      effortMultiplier: snapshot.sessions.effortMultiplier,
+    };
     snapshot.control.orcaFreshness = freshness;
     if (meta) {
       snapshot.work.workspace = meta.displayName ?? snapshot.work.workspace;
@@ -585,6 +615,7 @@ export default function (pi: ExtensionAPI) {
     snapshot.control.thinkingSummary = undefined;
     runningSubagents.clear();
     snapshot.sessions.subagentsRunning = 0;
+    subagentWorkMs = 0;
     lastFingerprint = "";
     restoreCost(ctx);
     if (!ctx.isIdle()) resumeWorkClock(); // reloaded mid-turn
@@ -654,17 +685,26 @@ export default function (pi: ExtensionAPI) {
     }, 60_000);
     clockTimer.unref?.();
 
+    // Summary ticker: keeps the row-4 sentence tracking the reasoning stream
+    // while a turn is active. refreshThinkingSummary() no-ops when idle,
+    // throttled, unchanged, or already in flight, so idle sessions pay nothing.
+    summaryTimer?.unref?.();
+    clearInterval(summaryTimer);
+    summaryTimer = setInterval(() => void refreshThinkingSummary(), SUMMARY_TICK_MS);
+    summaryTimer.unref?.();
+
   });
 
   // ── subagent fleet events (pi-subagents) ────────────────────────────────
 
-  const runningSubagents = new Set<string>();
+  /** Running subagent ids → local start time, for live delegated effort. */
+  const runningSubagents = new Map<string, number>();
 
   eventUnsubs.push(
     pi.events.on("subagents:started", (data) => {
       const d = data as { id?: string } | undefined;
       if (!d?.id) return;
-      runningSubagents.add(d.id);
+      if (!runningSubagents.has(d.id)) runningSubagents.set(d.id, Date.now());
       snapshot.sessions.subagentsRunning = runningSubagents.size;
       invalidate();
     }),
@@ -672,36 +712,48 @@ export default function (pi: ExtensionAPI) {
     pi.events.on("subagents:created", (data) => {
       const d = data as { id?: string } | undefined;
       if (!d?.id) return;
-      runningSubagents.add(d.id);
+      if (!runningSubagents.has(d.id)) runningSubagents.set(d.id, Date.now());
       snapshot.sessions.subagentsRunning = runningSubagents.size;
       invalidate();
     }),
 
     // Terminal events carry the whole run's spend as a pi Usage.
     pi.events.on("subagents:completed", (data) => {
-      const d = data as { id?: string; usage?: { cost?: { total?: number } } } | undefined;
+      const d = data as { id?: string; usage?: { cost?: { total?: number } }; durationMs?: number } | undefined;
       if (!d) return;
+      const startedAt = d.id ? runningSubagents.get(d.id) : undefined;
       if (d.id) runningSubagents.delete(d.id);
+      // The event's durationMs is the run's own measure; fall back to our clock.
+      const ranMs = typeof d.durationMs === "number" && d.durationMs > 0
+        ? d.durationMs
+        : (startedAt != null ? Math.max(0, Date.now() - startedAt) : 0);
+      if (ranMs > 0) subagentWorkMs += ranMs;
       const cost = d.usage?.cost?.total;
       if (cost != null) {
         subagentSpendUsd += cost;
         snapshot.sessions.subagentSpendUsd = subagentSpendUsd;
-        persistCost();
       }
+      if (cost != null || ranMs > 0) persistCost();
       snapshot.sessions.subagentsRunning = runningSubagents.size;
       invalidate();
     }),
 
     pi.events.on("subagents:failed", (data) => {
-      const d = data as { id?: string; usage?: { cost?: { total?: number } } } | undefined;
+      const d = data as { id?: string; usage?: { cost?: { total?: number } }; durationMs?: number } | undefined;
       if (!d) return;
+      const startedAt = d.id ? runningSubagents.get(d.id) : undefined;
       if (d.id) runningSubagents.delete(d.id);
+      // The event's durationMs is the run's own measure; fall back to our clock.
+      const ranMs = typeof d.durationMs === "number" && d.durationMs > 0
+        ? d.durationMs
+        : (startedAt != null ? Math.max(0, Date.now() - startedAt) : 0);
+      if (ranMs > 0) subagentWorkMs += ranMs;
       const cost = d.usage?.cost?.total;
       if (cost != null) {
         subagentSpendUsd += cost;
         snapshot.sessions.subagentSpendUsd = subagentSpendUsd;
-        persistCost();
       }
+      if (cost != null || ranMs > 0) persistCost();
       snapshot.sessions.subagentsRunning = runningSubagents.size;
       invalidate();
     }),
@@ -936,6 +988,10 @@ export default function (pi: ExtensionAPI) {
     if (clockTimer) {
       clearInterval(clockTimer);
       clockTimer = undefined;
+    }
+    if (summaryTimer) {
+      clearInterval(summaryTimer);
+      summaryTimer = undefined;
     }
     poller?.dispose();
     poller = undefined;

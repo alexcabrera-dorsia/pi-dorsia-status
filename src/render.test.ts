@@ -27,6 +27,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import {
   renderStatus,
   packRow,
+  computeEffort,
   emptySnapshot,
   GOAL_ROLE_SEGMENT_ID,
   LANE_PAIR,
@@ -581,17 +582,33 @@ describe("Q8: working time + cost rate", () => {
     expect(rows[0]).toContain("1h24m");
   });
 
-  it("folds subagent spend into the total with a compact breakdown", () => {
+  it("shows total, own, and delegated cost with distinct icons when subagents spent", () => {
     const snap = fullSnapshot();
     snap.sessions.subagentSpendUsd = 0.31;
-    const rows = renderStatus(200, snap, passthrough);
-    const model = strip(rows[0]);
-    expect(model).toContain("$0.73");   // 0.42 + 0.31
-    expect(model).toContain("sub $0.31");
-    // At narrow widths the breakdown evicts; the total survives.
-    const narrow = renderStatus(45, snap, passthrough);
-    expect(strip(narrow[0])).toContain("$0.73");
-    expect(strip(narrow[0])).not.toContain("sub");
+    const model = strip(renderStatus(200, snap, passthrough)[0]);
+    expect(model).toContain("$0.73");   // total = 0.42 + 0.31
+    expect(model).toContain("$0.42");   // this session's own spend
+    expect(model).toContain("$0.31");   // delegated spend
+    // Money / dollar / sitemap glyphs distinguish the three cells.
+    expect(model).toContain("\uf0d6");
+    expect(model).toContain("\uf155");
+    expect(model).toContain("\uf0e8");
+  });
+
+  it("uses one money-glyph cell for the session total when nothing was delegated", () => {
+    const model = strip(renderStatus(200, fullSnapshot(), passthrough)[0]);
+    expect(model).toContain("$0.42");
+    expect(model).toContain("\uf0d6");
+    expect(model).not.toContain("\uf0e8");
+  });
+
+  it("keeps the whole cost breakdown under width pressure (required cells)", () => {
+    const snap = fullSnapshot();
+    snap.sessions.subagentSpendUsd = 0.31;
+    const narrow = strip(renderStatus(50, snap, passthrough)[0]);
+    expect(narrow).toContain("$0.73");
+    expect(narrow).toContain("$0.42");
+    expect(narrow).toContain("$0.31");
   });
 
   it("renders cost burn rate when present", () => {
@@ -651,13 +668,30 @@ describe("Q9: work row contents", () => {
 // ── Q10: fleet row — active count + broad peer summaries ────────────────────
 
 describe("Q10: fleet row", () => {
-  it("renders the running subagent count (spend lives in the row-1 cost)", () => {
+  it("renders the running subagent count with their working time (spend lives on row 1)", () => {
     const snap = fullSnapshot();
     snap.sessions.subagentsRunning = 2;
     snap.sessions.subagentSpendUsd = 0.31;
-    const rows = renderStatus(200, snap, passthrough);
-    expect(strip(rows[2])).toContain("sub 2");
-    expect(strip(rows[2])).not.toContain("$0.31");
+    snap.sessions.subagentWorkMs = 72 * 60_000; // 1h12m of delegated work
+    const fleet = strip(renderStatus(200, snap, passthrough)[2]);
+    expect(fleet).toContain("sub 2");
+    expect(fleet).toContain("1h12m");
+    expect(fleet).toContain("\uf0e8");
+    expect(fleet).not.toContain("$0.31");
+  });
+
+  it("renders the effort multiplier for delegated work", () => {
+    const snap = fullSnapshot();
+    snap.sessions.subagentWorkMs = 90 * 60_000;
+    snap.sessions.effortMultiplier = 2.4;
+    const fleet = strip(renderStatus(200, snap, passthrough)[2]);
+    expect(fleet).toContain("×2.4");
+  });
+
+  it("omits the multiplier below a measurable threshold", () => {
+    const snap = fullSnapshot();
+    snap.sessions.effortMultiplier = 0.01;
+    expect(strip(renderStatus(200, snap, passthrough)[2])).not.toContain("×");
   });
 
   it("counts actively working peers", () => {

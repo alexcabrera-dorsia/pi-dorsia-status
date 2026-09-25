@@ -113,6 +113,10 @@ export interface SessionsLane {
   subagentsRunning?: number;
   /** Cumulative spend of completed subagents this session, in USD. */
   subagentSpendUsd?: number;
+  /** Cumulative working time of subagents (banked + in-flight), in ms. */
+  subagentWorkMs?: number;
+  /** Total effort (own work + subagent work) as a multiple of wall-clock time. */
+  effortMultiplier?: number;
 }
 
 export interface ControlLane {
@@ -417,8 +421,10 @@ export function packRow(
 const GLYPH = {
   // model row
   session: "\uf0e4", // nf-fa-tachometer (context window meter)
-  cost: "\uf155",   // nf-fa-dollar
-  duration: "\uf0e7", // nf-fa-bolt (time spent working)
+  cost: "\uf155",   // nf-fa-dollar (this session's own spend)
+  costTotal: "\uf0d6", // nf-fa-money (session + subagents)
+  subagents: "\uf0e8", // nf-fa-sitemap (delegated agent work)
+  duration: "\uf0e7", // nf-fa-bolt (effort: time spent working)
   model: "\uf2d0",  // nf-oct-cpu (provider/model)
   thinking: "\uf0eb", // nf-fa-lightbulb (thinking level)
   // work row
@@ -501,13 +507,25 @@ function renderModelRow(width: number, snap: Snapshot, theme: StatusTheme): stri
   // survives eviction; only extreme truncation cuts it. When subagents have
   // spent anything, the total folds their spend in and a compact "sub" cell
   // carries the breakdown:  $0.73 · sub $0.31
+  // Cost: money glyph = total, dollar = this session's own spend, sitemap =
+  // delegated spend. The mapping is stable, so money always reads as the total.
+  // All are required so they cannot be evicted; only extreme truncation trims
+  // them. With no delegated spend the single money cell is the session total.
   const subSpend = snap.sessions.subagentSpendUsd ?? 0;
-  const cost = fmtCost((s.costUsd ?? 0) + subSpend || undefined);
-  if (cost.text) {
-    left.push({ id: "session-cost", lane: "session", icon: GLYPH.cost, value: cost.text, tone: cost.tone, priority: 90, side: "left" });
+  const totalSpend = (s.costUsd ?? 0) + subSpend;
+  const total = fmtCost(totalSpend > 0 ? totalSpend : undefined);
+  if (total.text) {
+    left.push({
+      id: "session-cost-total", lane: "session", icon: GLYPH.costTotal,
+      value: total.text, tone: total.tone, priority: 92, side: "left",
+    });
   }
   if (subSpend > 0) {
-    left.push({ id: "session-cost-sub", lane: "session", label: "sub", value: `$${subSpend.toFixed(2)}`, tone: "muted", priority: 89, side: "left", optional: true });
+    const own = fmtCost(s.costUsd);
+    if (own.text) {
+      left.push({ id: "session-cost", lane: "session", icon: GLYPH.cost, value: own.text, tone: own.tone, priority: 91, side: "left" });
+    }
+    left.push({ id: "session-cost-sub", lane: "session", icon: GLYPH.subagents, value: `$${subSpend.toFixed(2)}`, tone: "muted", priority: 90, side: "left" });
   }
   if (s.workTimeMs != null && s.workTimeMs > 0) {
     left.push({ id: "session-worktime", lane: "session", icon: GLYPH.duration, value: fmtDuration(s.workTimeMs), tone: "dim", priority: 85, side: "left", optional: true });
@@ -571,6 +589,16 @@ function renderWorkRow(width: number, snap: Snapshot, theme: StatusTheme): strin
   return packRow(width, left, [], theme);
 }
 
+/** Effort accounting: own work + delegated work against wall-clock time.
+ *  The multiplier is how many agent-hours were spent per wall-clock hour, so
+ *  1.0 means a single serial worker and 2.4 means 2.4 workers' worth of effort
+ *  was in flight on average. */
+export function computeEffort(ownMs: number, subMs: number, wallMs: number): { totalMs: number; multiplier?: number } {
+  const totalMs = Math.max(0, ownMs) + Math.max(0, subMs);
+  const multiplier = wallMs > 60_000 ? totalMs / wallMs : undefined;
+  return { totalMs, multiplier };
+}
+
 /** Sibling states that count as actively working in the fleet view. */
 const FLEET_ACTIVE_STATES = new Set(["working", "running", "thinking", "calling-tools", "reading", "editing"]);
 
@@ -594,10 +622,18 @@ function renderFleetRow(width: number, snap: Snapshot, theme: StatusTheme): stri
     left.push({ id: "fleet-deleg", lane: "sessions", icon: GLYPH.deleg, label: "deleg", value: `${deleg}`, tone: "accent", priority: 100, side: "left", optional: true });
   }
 
-  // pi-subagents: running count (spend shows in the row-1 cost breakdown).
+  // pi-subagents: running count + their cumulative working time (spend shows
+  // in the row-1 cost breakdown).
   const subRunning = s.subagentsRunning ?? 0;
-  if (subRunning > 0) {
-    left.push({ id: "fleet-sub", lane: "sessions", icon: GLYPH.deleg, label: "sub", value: `${subRunning}`, tone: "accent", priority: 98, side: "left", optional: true });
+  const subWork = s.subagentWorkMs ?? 0;
+  if (subRunning > 0 || subWork > 0) {
+    const value = [subRunning > 0 ? `${subRunning}` : "", subWork > 0 ? fmtDuration(subWork) : ""].filter(Boolean).join(" · ");
+    left.push({ id: "fleet-sub", lane: "sessions", icon: GLYPH.subagents, label: "sub", value, tone: subRunning > 0 ? "accent" : "muted", priority: 98, side: "left", optional: true });
+  }
+  // Effort multiplier: total agent work ÷ wall-clock time, i.e. average
+  // parallelism across this session.
+  if (s.effortMultiplier != null && s.effortMultiplier >= 0.05) {
+    left.push({ id: "fleet-multiplier", lane: "sessions", icon: GLYPH.duration, value: `×${s.effortMultiplier.toFixed(1)}`, tone: s.effortMultiplier >= 2 ? "accent" : "dim", priority: 96, side: "left", optional: true });
   }
 
   // Per-sibling: state glyph + broad summary (title, else last message preview).
